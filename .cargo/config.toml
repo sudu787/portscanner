@@ -1,0 +1,6 @@
+[build]
+# Redirect build artifacts out of the project folder entirely.
+# Windows Defender watches network-related executables inside Development/
+# very aggressively — locking .o and .exe files mid-compile.
+# Placing the target dir under AppData\Local avoids that scan zone.
+target-dir = "C:\\Users\\sudu\\AppData\\Local\\cargo-builds\\rustscan-rs"
