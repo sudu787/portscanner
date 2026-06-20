@@ -40,9 +40,9 @@ cargo run -- 192.168.1.0/24
 ```
 
 ### Specific Ports
-Use the `-p` or `--ports` flag to define a range:
+Use the `--start-port` and `--end-port` flags to define a range:
 ```bash
-cargo run -- 10.0.0.5 -p 80-443
+cargo run -- 10.0.0.5 --start-port 80 --end-port 443
 ```
 
 ### TCP and UDP Scanning
@@ -70,8 +70,9 @@ Arguments:
   <TARGET>  Target IP address, hostname, or CIDR network (e.g., 192.168.1.1, scanme.nmap.org, 10.0.0.0/24)
 
 Options:
-  -p, --ports <PORTS>            Port range to scan (e.g., 1-1024) [default: 1-1024]
-  -t, --timeout <TIMEOUT>        Connection timeout per port in ms [default: 1000]
+  --start-port <PORT>        First port of the scan range [default: 1]
+  --end-port <PORT>          Last port of the scan range [default: 1024]
+  --timeout <MS>             Connection timeout per port in ms [default: 1500]
   -c, --concurrency <CONCURRENCY> Max concurrent connections [default: 1000]
       --tcp                      Scan TCP ports (Default if neither --tcp nor --udp are provided)
       --udp                      Scan UDP ports
