@@ -63,13 +63,24 @@ pub fn print_text_multi(
         let open: Vec<_> = result.open_ports().collect();
 
         if multi {
-            println!("{BOLD}{CYAN}  ┌─ {}{RESET}", result.target);
+            if let Some(h) = &result.hostname {
+                println!("{BOLD}{CYAN}  ┌─ {} ({}){RESET}", h, result.target);
+            } else {
+                println!("{BOLD}{CYAN}  ┌─ {}{RESET}", result.target);
+            }
         } else {
             println!();
-            println!(
-                "{BOLD}{CYAN}Scan Results — {} ({}){RESET}",
-                resolved.spec, result.target
-            );
+            if let Some(h) = &result.hostname {
+                println!(
+                    "{BOLD}{CYAN}Scan Results — {} ({} / {}){RESET}",
+                    resolved.spec, h, result.target
+                );
+            } else {
+                println!(
+                    "{BOLD}{CYAN}Scan Results — {} ({}){RESET}",
+                    resolved.spec, result.target
+                );
+            }
         }
 
         println!("{CYAN}  ────────────────────────────────────────{RESET}");
@@ -162,6 +173,7 @@ pub fn print_json_multi(
 
             json!({
                 "host":        r.target,
+                "hostname":    r.hostname,
                 "total_ports": r.total_ports,
                 "open_count":  r.open_count(),
                 "elapsed_ms":  r.elapsed.as_millis(),
@@ -176,6 +188,7 @@ pub fn print_json_multi(
             "rustscan_rs": {
                 "target":       spec,
                 "resolved_ip":  results[0].target,
+                "hostname":     results[0].hostname,
                 "total_ports":  results[0].total_ports,
                 "open_count":   results[0].open_count(),
                 "elapsed_ms":   results[0].elapsed.as_millis(),
@@ -204,7 +217,7 @@ pub fn print_json_multi(
 
 pub fn print_csv_multi(results: &[ScanResult]) {
     // Print standard CSV header
-    println!("Host,Port,Status,TLS,Service,Banner");
+    println!("Host,Hostname,Port,Status,TLS,Service,Banner");
 
     for r in results {
         // In CSV mode, it's typically best to only export open ports
@@ -229,9 +242,11 @@ pub fn print_csv_multi(results: &[ScanResult]) {
                 crate::service::Transport::TcpUdp => "tcp/udp",
             };
 
+            let hostname_str = r.hostname.as_deref().unwrap_or("");
+
             println!(
-                "{},{}/{},{},{},{},\"{}\"",
-                r.target, p.port, proto_str, status, tls_str, p.service.name, banner_escaped
+                "{},{},{}/{},{},{},{},\"{}\"",
+                r.target, hostname_str, p.port, proto_str, status, tls_str, p.service.name, banner_escaped
             );
         }
     }
@@ -275,7 +290,11 @@ pub fn print_html_multi(spec: &str, results: &[ScanResult], elapsed: Duration) {
     // Per-host blocks
     for result in results {
         println!("  <div class=\"host-block\">");
-        println!("    <h2>Host: {}</h2>", result.target);
+        if let Some(h) = &result.hostname {
+            println!("    <h2>Host: {} ({})</h2>", h, result.target);
+        } else {
+            println!("    <h2>Host: {}</h2>", result.target);
+        }
         
         if result.open_count() == 0 {
             println!("    <p>No open ports found.</p>");

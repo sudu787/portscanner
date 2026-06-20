@@ -17,12 +17,13 @@
 ///               └─ collect Vec<ScanResult> → print_text_multi / print_json_multi
 
 mod cli;
-mod errors;
-mod output;
-mod probes;
-mod scanner;
-mod service;
-mod targets;
+pub mod dns;
+pub mod errors;
+pub mod output;
+pub mod probes;
+pub mod scanner;
+pub mod service;
+pub mod targets;
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -99,6 +100,7 @@ async fn main() -> Result<()> {
             tls:         args.tls,
             tcp:         args.do_tcp(),
             udp:         args.do_udp(),
+            resolve_dns: args.resolve_dns,
         });
 
         info!(

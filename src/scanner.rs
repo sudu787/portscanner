@@ -84,11 +84,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, trace, warn};
-use crate::service::Transport;
 
 use crate::errors::RustScanError;
 use crate::probes::{detect_tls, grab_banner};
-use crate::service::{detect_service, ServiceInfo};
+use crate::service::{detect_service, ServiceInfo, Transport};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -131,6 +130,8 @@ pub struct PortResult {
 pub struct ScanResult {
     /// Human-readable target (IP or hostname as given).
     pub target: String,
+    /// The resolved hostname of the target, if requested and successful.
+    pub hostname: Option<String>,
     /// Total number of ports in the requested range.
     pub total_ports: u32,
     /// Wall-clock time for the full scan.
@@ -161,8 +162,8 @@ impl ScanResult {
 /// copying the contents.
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
-    /// Resolved target IP address.
-    pub addr: IpAddr,
+    /// The target IP address.
+    pub addr:        IpAddr,
     /// First port to probe (inclusive).
     pub start_port: u16,
     /// Last port to probe (inclusive).
@@ -179,6 +180,8 @@ pub struct ScanConfig {
     pub banner: bool,
     /// Whether to probe open ports for TLS support.
     pub tls: bool,
+    /// Automatically resolve target IPs to hostnames via reverse DNS.
+    pub resolve_dns: bool,
     /// Scan TCP ports.
     pub tcp: bool,
     /// Scan UDP ports.
@@ -504,8 +507,16 @@ pub async fn scan_host(config: Arc<ScanConfig>) -> Result<ScanResult, RustScanEr
         "host scan complete"
     );
 
+    // ── Reverse DNS ───────────────────────────────────────────────────────
+    let hostname = if config.resolve_dns {
+        crate::dns::reverse_dns(config.addr).await
+    } else {
+        None
+    };
+
     Ok(ScanResult {
-        target: config.addr.to_string(),
+        target:      config.addr.to_string(),
+        hostname,
         total_ports,
         elapsed,
         ports: results,
@@ -576,7 +587,8 @@ mod tests {
 
     fn make_result(statuses: &[(u16, PortStatus)]) -> ScanResult {
         ScanResult {
-            target: "127.0.0.1".to_string(),
+            target:      "127.0.0.1".to_string(),
+            hostname:    None,
             total_ports: statuses.len() as u32,
             elapsed: Duration::from_millis(1),
             ports: statuses
@@ -632,6 +644,7 @@ mod tests {
             tls:         false,
             tcp:         true,
             udp:         false,
+            resolve_dns: false,
         });
 
         let result = scan_host(config).await.expect("scan should not error");
@@ -657,6 +670,7 @@ mod tests {
             tls:         false,
             tcp:         true,
             udp:         false,
+            resolve_dns: false,
         });
 
         let result = scan_host(config).await.unwrap();
@@ -683,6 +697,7 @@ mod tests {
             tls:         false,
             tcp:         true,
             udp:         false,
+            resolve_dns: false,
         });
 
         // Manually replicate what scan_host does and then check the semaphore.
@@ -709,6 +724,7 @@ mod tests {
             tls:         false,
             tcp:         true,
             udp:         false,
+            resolve_dns: false,
         });
 
         let result = scan_host(config).await.unwrap();
