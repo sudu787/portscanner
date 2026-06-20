@@ -111,16 +111,16 @@ pub struct CliArgs {
 
     // ── Output formats ─────────────────────────────────────────────────────
     /// Emit results as machine-readable JSON.
-    #[arg(long, help = "Output results in JSON format", conflicts_with_all = ["csv", "html"])]
-    pub json: bool,
+    #[arg(long, help = "Output results in JSON format", value_name = "FILE", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["csv", "html"])]
+    pub json: Option<String>,
 
     /// Emit results as CSV (comma-separated values).
-    #[arg(long, help = "Output results in CSV format", conflicts_with_all = ["json", "html"])]
-    pub csv: bool,
+    #[arg(long, help = "Output results in CSV format", value_name = "FILE", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["json", "html"])]
+    pub csv: Option<String>,
 
     /// Emit results as a self-contained HTML report.
-    #[arg(long, help = "Output results as an HTML report", conflicts_with_all = ["json", "csv"])]
-    pub html: bool,
+    #[arg(long, help = "Output results as an HTML report", value_name = "FILE", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["json", "csv"])]
+    pub html: Option<String>,
 
     // ── Probing options ────────────────────────────────────────────────────
     /// Perform a UDP scan.
@@ -199,11 +199,11 @@ impl CliArgs {
 
     /// Derive the output format selected by the user.
     pub fn output_format(&self) -> OutputFormat {
-        if self.json {
+        if self.json.is_some() {
             OutputFormat::Json
-        } else if self.csv {
+        } else if self.csv.is_some() {
             OutputFormat::Csv
-        } else if self.html {
+        } else if self.html.is_some() {
             OutputFormat::Html
         } else {
             OutputFormat::Text
@@ -276,9 +276,9 @@ mod tests {
             end_port: 1024,
             timeout: DEFAULT_TIMEOUT_MS,
             concurrency: DEFAULT_CONCURRENCY,
-            json: false,
-            csv: false,
-            html: false,
+            json: None,
+            csv: None,
+            html: None,
             banner: false,
             resolve_dns: false,
             tls: false,
@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn output_format_json() {
         let mut args = valid_args();
-        args.json = true;
+        args.json = Some("".to_string());
         assert_eq!(args.output_format(), OutputFormat::Json);
     }
 }

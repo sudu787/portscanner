@@ -19,6 +19,7 @@
 mod cli;
 pub mod dns;
 pub mod errors;
+pub mod export;
 pub mod output;
 pub mod probes;
 pub mod scanner;
@@ -127,6 +128,21 @@ async fn main() -> Result<()> {
         OutputFormat::Csv  => output::print_csv_multi(&all_results),
         OutputFormat::Html => output::print_html_multi(&args.target, &all_results, total_elapsed),
         OutputFormat::Text => output::print_text_multi(&resolved, &all_results, total_elapsed),
+    }
+
+    // ── 5. File Export ───────────────────────────────────────────────────
+    if let Some(path) = &args.json {
+        if !path.is_empty() {
+            export::export_json(path, &all_results)?;
+            info!("Exported JSON to {}", path);
+        }
+    }
+    
+    if let Some(path) = &args.csv {
+        if !path.is_empty() {
+            export::export_csv(path, &all_results)?;
+            info!("Exported CSV to {}", path);
+        }
     }
 
     Ok(())
