@@ -43,6 +43,9 @@ use targets::{parse_target, ResolvedTarget, TargetKind};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install default crypto provider for rustls (fixes panic when multiple features are enabled)
+    rustls::crypto::ring::default_provider().install_default().ok();
+
     // ── 1. Parse & validate ───────────────────────────────────────────────
     let args = CliArgs::parse();
     args.validate()
