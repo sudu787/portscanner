@@ -74,11 +74,11 @@ fn clean_banner(data: &[u8]) -> String {
 /// We use a custom verifier that explicitly ignores ALL certificate errors
 /// (expired, wrong domain, self-signed, etc.). We do not care if the certificate
 /// is mathematically valid — we only care if the port *speaks* TLS.
-pub async fn detect_tls(addr: IpAddr, port: u16, timeout: Duration) -> bool {
+pub async fn detect_tls(addr: IpAddr, port: u16, timeout: Duration) -> Option<crate::tls::TlsCertInfo> {
     let connect_future = TcpStream::connect((addr, port));
     let stream = match tokio::time::timeout(timeout, connect_future).await {
         Ok(Ok(s)) => s,
-        _ => return false,
+        _ => return None,
     };
 
     // Construct the permissive TLS configuration
@@ -99,8 +99,21 @@ pub async fn detect_tls(addr: IpAddr, port: u16, timeout: Duration) -> bool {
     // (Even with our permissive verifier, a non-TLS server will cause the
     // handshake to fail with a protocol error when we send the ClientHello).
     match tokio::time::timeout(timeout, handshake_future).await {
-        Ok(Ok(_)) => true,
-        _ => false,
+        Ok(Ok(tls_stream)) => {
+            if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
+                if let Some(first_cert) = certs.first() {
+                    return crate::tls::parse_cert(first_cert.as_ref());
+                }
+            }
+            // Handshake succeeded but no certificate could be extracted or parsed
+            Some(crate::tls::TlsCertInfo {
+                subject: "Unknown (TLS Handshake OK)".into(),
+                issuer: "Unknown".into(),
+                not_before: "".into(),
+                not_after: "".into(),
+            })
+        }
+        _ => None,
     }
 }
 

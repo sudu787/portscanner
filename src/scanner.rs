@@ -121,8 +121,10 @@ pub struct PortResult {
     pub service: ServiceInfo,
     /// The grabbed service banner, if any.
     pub banner: Option<String>,
-    /// Whether a TLS handshake succeeded.
-    pub is_tls: bool,
+    /// Was a TLS handshake successful?
+    pub tls: bool,
+    /// Extracted TLS certificate metadata (if TLS handshake succeeded).
+    pub tls_cert: Option<crate::tls::TlsCertInfo>,
 }
 
 /// Aggregated results returned by [`scan_host`].
@@ -220,7 +222,7 @@ pub async fn scan_port(
         "probing"
     );
 
-    let (status, banner, is_tls) = match protocol {
+    let (status, banner, is_tls, tls_cert) = match protocol {
         Transport::Tcp => probe_tcp(socket_addr, timeout_dur, do_banner, do_tls).await?,
         Transport::Udp => probe_udp(socket_addr, timeout_dur).await?,
         Transport::TcpUdp => unreachable!("Scan iteration uses explicit Tcp or Udp"),
@@ -232,7 +234,8 @@ pub async fn scan_port(
         status,
         service: detect_service(port, protocol),
         banner,
-        is_tls,
+        tls: is_tls,
+        tls_cert,
     })
 }
 
@@ -241,40 +244,42 @@ async fn probe_tcp(
     timeout_dur: Duration,
     do_banner: bool,
     do_tls: bool,
-) -> Result<(PortStatus, Option<String>, bool), RustScanError> {
+) -> Result<(PortStatus, Option<String>, bool, Option<crate::tls::TlsCertInfo>), RustScanError> {
     let port = socket_addr.port();
     match timeout(timeout_dur, TcpStream::connect(socket_addr)).await {
         Err(_) => {
             trace!(port, "filtered (timeout)");
-            Ok((PortStatus::Filtered, None, false))
+            Ok((PortStatus::Filtered, None, false, None))
         }
         Ok(Ok(mut stream)) => {
             debug!(port, "open");
             let mut banner_str = None;
-            let mut is_tls_flag = false;
             if do_banner {
                 banner_str = grab_banner(&mut stream).await;
             }
             drop(stream);
+            let mut tls_cert = None;
+            let mut is_tls_flag = false;
             if do_tls {
-                is_tls_flag = detect_tls(socket_addr.ip(), port, timeout_dur).await;
+                tls_cert = detect_tls(socket_addr.ip(), port, timeout_dur).await;
+                is_tls_flag = tls_cert.is_some();
             }
-            Ok((PortStatus::Open, banner_str, is_tls_flag))
+            Ok((PortStatus::Open, banner_str, is_tls_flag, tls_cert))
         }
         Ok(Err(io_err)) => {
             use std::io::ErrorKind;
             match io_err.kind() {
                 ErrorKind::ConnectionRefused => {
                     trace!(port, "closed (RST)");
-                    Ok((PortStatus::Closed, None, false))
+                    Ok((PortStatus::Closed, None, false, None))
                 }
                 ErrorKind::TimedOut | ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
                     trace!(port, "filtered (unreachable)");
-                    Ok((PortStatus::Filtered, None, false))
+                    Ok((PortStatus::Filtered, None, false, None))
                 }
                 ErrorKind::PermissionDenied => {
                     warn!(port, "permission denied — skipping");
-                    Ok((PortStatus::Filtered, None, false))
+                    Ok((PortStatus::Filtered, None, false, None))
                 }
                 _ => Err(RustScanError::Io(io::Error::new(
                     io_err.kind(),
@@ -288,7 +293,7 @@ async fn probe_tcp(
 async fn probe_udp(
     socket_addr: SocketAddr,
     timeout_dur: Duration,
-) -> Result<(PortStatus, Option<String>, bool), RustScanError> {
+) -> Result<(PortStatus, Option<String>, bool, Option<crate::tls::TlsCertInfo>), RustScanError> {
     let port = socket_addr.port();
     
     // Bind an ephemeral UDP port
@@ -317,23 +322,23 @@ async fn probe_udp(
     match timeout(timeout_dur, socket.recv(&mut buf)).await {
         Err(_) => {
             trace!(port, "open|filtered (timeout)");
-            Ok((PortStatus::OpenFiltered, None, false))
+            Ok((PortStatus::OpenFiltered, None, false, None))
         }
         Ok(Ok(_n)) => {
             debug!(port, "open (received data)");
-            Ok((PortStatus::Open, None, false)) // Could grab UDP banners here later
+            Ok((PortStatus::Open, None, false, None)) // Could grab UDP banners here later
         }
         Ok(Err(io_err)) => {
             use std::io::ErrorKind;
             if io_err.kind() == ErrorKind::ConnectionReset {
                 trace!(port, "closed (ICMP Port Unreachable)");
-                Ok((PortStatus::Closed, None, false))
+                Ok((PortStatus::Closed, None, false, None))
             } else if io_err.kind() == ErrorKind::PermissionDenied {
                 warn!(port, "permission denied — skipping");
-                Ok((PortStatus::OpenFiltered, None, false))
+                Ok((PortStatus::Closed, None, false, None))
             } else {
                 trace!(port, "open|filtered (other error: {:?})", io_err.kind());
-                Ok((PortStatus::OpenFiltered, None, false))
+                Ok((PortStatus::OpenFiltered, None, false, None))
             }
         }
     }
@@ -599,7 +604,8 @@ mod tests {
                     status:   s.clone(),
                     service:  detect_service(*p, Transport::Tcp),
                     banner:   None,
-                    is_tls:   false,
+                    tls:      false,
+                    tls_cert: None,
                 })
                 .collect(),
         }

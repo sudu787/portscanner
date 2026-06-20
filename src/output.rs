@@ -111,7 +111,7 @@ pub fn print_text_multi(
             println!("  {DIM}  {}{RESET}", "─".repeat(55));
             for pr in &open {
                 let svc = pr.service;
-                let tls_marker = if pr.is_tls { "🔒" } else { " " };
+                let tls_marker = if pr.tls { "🔒" } else { " " };
                 let desc = match &pr.banner {
                     Some(b) => format!("{}{RESET}", b), // Banner overrides description if present
                     None    => format!("{}{RESET}", if svc.is_known() { svc.description } else { "" }),
@@ -130,6 +130,11 @@ pub fn print_text_multi(
                     svc.name,
                     desc
                 );
+                
+                // Print TLS Certificate if grabbed
+                if let Some(cert) = &pr.tls_cert {
+                    println!("        {DIM}└─ TLS Cert: {} ({}) — Expires: {}{RESET}", cert.subject, cert.issuer, cert.not_after);
+                }
             }
         }
         println!();
@@ -159,7 +164,8 @@ pub fn print_json_multi(
                             PortStatus::Filtered     => "filtered",
                             PortStatus::OpenFiltered => "open|filtered",
                         },
-                        "is_tls":      p.is_tls,
+                        "tls":         p.tls,
+                        "tls_cert":    p.tls_cert,
                         "banner":      p.banner,
                         "service": {
                             "name":        p.service.name,
@@ -230,7 +236,7 @@ pub fn print_csv_multi(results: &[ScanResult]) {
                 PortStatus::OpenFiltered => "open|filtered",
             };
             
-            let tls_str = if p.is_tls { "true" } else { "false" };
+            let tls_str = if p.tls { "true" } else { "false" };
             
             // Escape quotes inside banners
             let banner = p.banner.as_deref().unwrap_or("");
@@ -317,7 +323,7 @@ pub fn print_html_multi(spec: &str, results: &[ScanResult], elapsed: Duration) {
                     crate::service::Transport::TcpUdp => "tcp/udp",
                 };
                 print!("          <td><span class=\"badge-open\">{}/{}</span>", p.port, proto_str);
-                if p.is_tls {
+                if p.tls {
                     print!("<span class=\"badge-tls\">TLS</span>");
                 }
                 println!("</td>");

@@ -24,6 +24,7 @@ pub mod probes;
 pub mod scanner;
 pub mod service;
 pub mod targets;
+pub mod tls;
 
 use std::net::IpAddr;
 use std::sync::Arc;
