@@ -22,6 +22,7 @@ pub mod errors;
 pub mod export;
 pub mod output;
 pub mod probes;
+pub mod report;
 pub mod scanner;
 pub mod service;
 pub mod targets;
@@ -126,7 +127,7 @@ async fn main() -> Result<()> {
     match args.output_format() {
         OutputFormat::Json => output::print_json_multi(&args.target, &all_results, total_elapsed)?,
         OutputFormat::Csv  => output::print_csv_multi(&all_results),
-        OutputFormat::Html => output::print_html_multi(&args.target, &all_results, total_elapsed),
+        OutputFormat::Html => report::generate_html_report("", &all_results, total_elapsed)?,
         OutputFormat::Text => output::print_text_multi(&resolved, &all_results, total_elapsed),
     }
 
@@ -142,6 +143,13 @@ async fn main() -> Result<()> {
         if !path.is_empty() {
             export::export_csv(path, &all_results)?;
             info!("Exported CSV to {}", path);
+        }
+    }
+
+    if let Some(path) = &args.html {
+        if !path.is_empty() {
+            report::generate_html_report(path, &all_results, total_elapsed)?;
+            info!("Exported HTML report to {}", path);
         }
     }
 

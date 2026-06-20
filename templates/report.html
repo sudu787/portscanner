@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>rustscan-rs | Scan Report</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --surface-color: #1e293b;
+            --primary: #3b82f6;
+            --primary-glow: rgba(59, 130, 246, 0.5);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border: #334155;
+            --success: #10b981;
+            --warning: #f59e0b;
+        }
+
+        body {
+            margin: 0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 3rem;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 1rem;
+        }
+
+        h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin: 0;
+            background: linear-gradient(to right, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        /* Summary Cards */
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 3rem;
+        }
+
+        .card {
+            background: var(--surface-color);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0 15px var(--primary-glow);
+            border-color: var(--primary);
+        }
+
+        .card h3 {
+            margin: 0 0 0.5rem 0;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .card .value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin: 0;
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            margin-bottom: 1.5rem;
+            gap: 1rem;
+        }
+
+        input[type="text"] {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--surface-color);
+            color: var(--text-main);
+            font-size: 1rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        input[type="text"]:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+        }
+
+        /* Table */
+        .table-container {
+            background: var(--surface-color);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            overflow: hidden;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th {
+            background: rgba(15, 23, 42, 0.5);
+            padding: 1rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            cursor: pointer;
+            user-select: none;
+            transition: color 0.2s;
+        }
+
+        th:hover {
+            color: var(--text-main);
+        }
+
+        td {
+            padding: 1rem;
+            border-top: 1px solid var(--border);
+            vertical-align: top;
+        }
+
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge.open { background: rgba(16, 185, 129, 0.1); color: var(--success); }
+        .badge.tls { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
+
+        .banner-text {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            background: rgba(0,0,0,0.2);
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            display: block;
+            margin-top: 0.5rem;
+        }
+
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>rustscan-rs Dashboard</h1>
+            <div style="color: var(--text-muted)">Generated at {{ current_time }}</div>
+        </header>
+
+        <div class="summary-grid">
+            <div class="card">
+                <h3>Total Hosts</h3>
+                <p class="value">{{ total_hosts }}</p>
+            </div>
+            <div class="card">
+                <h3>Open Ports</h3>
+                <p class="value" style="color: var(--success)">{{ total_open_ports }}</p>
+            </div>
+            <div class="card">
+                <h3>Elapsed Time</h3>
+                <p class="value">{{ elapsed }}</p>
+            </div>
+        </div>
+
+        <div class="controls">
+            <input type="text" id="searchInput" placeholder="Search by IP, port, service, or banner..." onkeyup="filterTable()">
+        </div>
+
+        <div class="table-container">
+            <table id="resultsTable">
+                <thead>
+                    <tr>
+                        <th onclick="sortTable(0)">Target ↕</th>
+                        <th onclick="sortTable(1)">Port ↕</th>
+                        <th onclick="sortTable(2)">Service ↕</th>
+                        <th onclick="sortTable(3)">Status ↕</th>
+                        <th>Details</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for record in records %}
+                    <tr>
+                        <td>
+                            <strong>{{ record.host }}</strong>
+                            {% match record.hostname %}
+                                {% when Some with (h) %}
+                                <div style="font-size: 0.875rem; color: var(--text-muted)">{{ h }}</div>
+                                {% when None %}
+                            {% endmatch %}
+                        </td>
+                        <td>{{ record.port }}</td>
+                        <td>{{ record.service }}</td>
+                        <td><span class="badge open">{{ record.status }}</span></td>
+                        <td>
+                            {% if record.tls_subject.is_some() %}
+                                <span class="badge tls">🔒 TLS</span>
+                                <div class="banner-text">
+                                    {% match record.tls_subject %}
+                                        {% when Some with (sub) %} Subj: {{ sub }}
+                                        {% when None %}
+                                    {% endmatch %}<br>
+                                    {% match record.tls_issuer %}
+                                        {% when Some with (iss) %} Iss: {{ iss }}
+                                        {% when None %}
+                                    {% endmatch %}
+                                </div>
+                            {% endif %}
+                            
+                            {% match record.banner %}
+                                {% when Some with (b) %}
+                                <div class="banner-text">{{ b }}</div>
+                                {% when None %}
+                            {% endmatch %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        function filterTable() {
+            let input = document.getElementById("searchInput");
+            let filter = input.value.toUpperCase();
+            let table = document.getElementById("resultsTable");
+            let tr = table.getElementsByTagName("tr");
+
+            for (let i = 1; i < tr.length; i++) {
+                let rowText = tr[i].textContent || tr[i].innerText;
+                if (rowText.toUpperCase().indexOf(filter) > -1) {
+                    tr[i].classList.remove("hidden");
+                } else {
+                    tr[i].classList.add("hidden");
+                }
+            }
+        }
+
+        function sortTable(n) {
+            let table = document.getElementById("resultsTable");
+            let switching = true;
+            let dir = "asc"; 
+            let switchcount = 0;
+            
+            while (switching) {
+                switching = false;
+                let rows = table.rows;
+                let i;
+                for (i = 1; i < (rows.length - 1); i++) {
+                    let shouldSwitch = false;
+                    let x = rows[i].getElementsByTagName("TD")[n];
+                    let y = rows[i + 1].getElementsByTagName("TD")[n];
+                    
+                    let xContent = x.innerHTML.toLowerCase();
+                    let yContent = y.innerHTML.toLowerCase();
+                    
+                    if (!isNaN(parseInt(x.innerText)) && !isNaN(parseInt(y.innerText))) {
+                        xContent = parseInt(x.innerText);
+                        yContent = parseInt(y.innerText);
+                    }
+
+                    if (dir == "asc") {
+                        if (xContent > yContent) {
+                            shouldSwitch = true;
+                            break;
+                        }
+                    } else if (dir == "desc") {
+                        if (xContent < yContent) {
+                            shouldSwitch = true;
+                            break;
+                        }
+                    }
+                }
+                if (shouldSwitch) {
+                    rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
+                    switching = true;
+                    switchcount ++;      
+                } else {
+                    if (switchcount == 0 && dir == "asc") {
+                        dir = "desc";
+                        switching = true;
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+</html>
