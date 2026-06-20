@@ -4,7 +4,6 @@
 /// performs semantic checks that clap's declarative layer cannot express,
 /// returning typed `RustScanError` variants so the caller can handle each
 /// failure precisely.
-
 use clap::Parser;
 
 use crate::errors::{Result, RustScanError};
@@ -169,7 +168,7 @@ pub enum OutputFormat {
 impl CliArgs {
     /// Returns true if a TCP scan should be performed.
     pub fn do_tcp(&self) -> bool {
-        self.tcp || (!self.tcp && !self.udp)
+        self.tcp || !self.udp
     }
 
     /// Returns true if a UDP scan should be performed.

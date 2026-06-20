@@ -8,7 +8,6 @@
 /// - JSON: Machine-readable schema (single and multi-host).
 /// - CSV:  Comma-separated values for spreadsheet tools.
 /// - HTML: Self-contained graphical report.
-
 use std::time::Duration;
 
 use anyhow::Result;
@@ -24,13 +23,13 @@ pub fn print_text_multi(
     results: &[ScanResult],
     total_elapsed: Duration,
 ) {
-    const BOLD:   &str = "\x1b[1m";
-    const GREEN:  &str = "\x1b[32m";
-    const RED:    &str = "\x1b[31m";
-    const CYAN:   &str = "\x1b[36m";
+    const BOLD: &str = "\x1b[1m";
+    const GREEN: &str = "\x1b[32m";
+    const RED: &str = "\x1b[31m";
+    const CYAN: &str = "\x1b[36m";
     const YELLOW: &str = "\x1b[33m";
-    const DIM:    &str = "\x1b[2m";
-    const RESET:  &str = "\x1b[0m";
+    const DIM: &str = "\x1b[2m";
+    const RESET: &str = "\x1b[0m";
 
     let multi = results.len() > 1;
 
@@ -105,8 +104,8 @@ pub fn print_text_multi(
             println!("  {BOLD}{GREEN}OPEN PORTS:{RESET}");
             // Column widths: port (5), tls (3), service name (12), description / banner
             println!(
-                "  {DIM}  {:<5} {:<3} {:<12} {}{RESET}",
-                "PORT", "TLS", "SERVICE", "DESCRIPTION / BANNER"
+                "  {DIM}  {:<5} {:<3} {:<12} DESCRIPTION / BANNER{RESET}",
+                "PORT", "TLS", "SERVICE"
             );
             println!("  {DIM}  {}{RESET}", "─".repeat(55));
             for pr in &open {
@@ -114,7 +113,10 @@ pub fn print_text_multi(
                 let tls_marker = if pr.tls { "🔒" } else { " " };
                 let desc = match &pr.banner {
                     Some(b) => format!("{}{RESET}", b), // Banner overrides description if present
-                    None    => format!("{}{RESET}", if svc.is_known() { svc.description } else { "" }),
+                    None => format!(
+                        "{}{RESET}",
+                        if svc.is_known() { svc.description } else { "" }
+                    ),
                 };
 
                 let proto_str = match pr.protocol {
@@ -130,10 +132,13 @@ pub fn print_text_multi(
                     svc.name,
                     desc
                 );
-                
+
                 // Print TLS Certificate if grabbed
                 if let Some(cert) = &pr.tls_cert {
-                    println!("        {DIM}└─ TLS Cert: {} ({}) — Expires: {}{RESET}", cert.subject, cert.issuer, cert.not_after);
+                    println!(
+                        "        {DIM}└─ TLS Cert: {} ({}) — Expires: {}{RESET}",
+                        cert.subject, cert.issuer, cert.not_after
+                    );
                 }
             }
         }
@@ -143,11 +148,7 @@ pub fn print_text_multi(
 
 // ─── JSON Output ──────────────────────────────────────────────────────────────
 
-pub fn print_json_multi(
-    spec: &str,
-    results: &[ScanResult],
-    total_elapsed: Duration,
-) -> Result<()> {
+pub fn print_json_multi(spec: &str, results: &[ScanResult], total_elapsed: Duration) -> Result<()> {
     let host_docs: Vec<_> = results
         .iter()
         .map(|r| {
@@ -230,14 +231,14 @@ pub fn print_csv_multi(results: &[ScanResult]) {
         // to prevent generating massive files for full range scans.
         for p in r.open_ports() {
             let status = match p.status {
-                PortStatus::Open         => "open",
-                PortStatus::Closed       => "closed",
-                PortStatus::Filtered     => "filtered",
+                PortStatus::Open => "open",
+                PortStatus::Closed => "closed",
+                PortStatus::Filtered => "filtered",
                 PortStatus::OpenFiltered => "open|filtered",
             };
-            
+
             let tls_str = if p.tls { "true" } else { "false" };
-            
+
             // Escape quotes inside banners
             let banner = p.banner.as_deref().unwrap_or("");
             let banner_escaped = banner.replace('"', "\"\"");
@@ -252,7 +253,14 @@ pub fn print_csv_multi(results: &[ScanResult]) {
 
             println!(
                 "{},{},{}/{},{},{},{},\"{}\"",
-                r.target, hostname_str, p.port, proto_str, status, tls_str, p.service.name, banner_escaped
+                r.target,
+                hostname_str,
+                p.port,
+                proto_str,
+                status,
+                tls_str,
+                p.service.name,
+                banner_escaped
             );
         }
     }
@@ -280,17 +288,23 @@ pub fn print_html_multi(spec: &str, results: &[ScanResult], elapsed: Duration) {
     println!("  </style>");
     println!("</head>");
     println!("<body>");
-    
+
     // Summary block
     let total_hosts = results.len();
     let total_open: usize = results.iter().map(|r| r.open_count()).sum();
-    
+
     println!("  <h1>Rustscan-rs Report</h1>");
     println!("  <div class=\"summary\">");
     println!("    <p><strong>Target:</strong> {}</p>", spec);
     println!("    <p><strong>Hosts Scanned:</strong> {}</p>", total_hosts);
-    println!("    <p><strong>Total Open Ports:</strong> {}</p>", total_open);
-    println!("    <p><strong>Total Elapsed Time:</strong> {:.2}s</p>", elapsed.as_secs_f64());
+    println!(
+        "    <p><strong>Total Open Ports:</strong> {}</p>",
+        total_open
+    );
+    println!(
+        "    <p><strong>Total Elapsed Time:</strong> {:.2}s</p>",
+        elapsed.as_secs_f64()
+    );
     println!("  </div>");
 
     // Per-host blocks
@@ -301,7 +315,7 @@ pub fn print_html_multi(spec: &str, results: &[ScanResult], elapsed: Duration) {
         } else {
             println!("    <h2>Host: {}</h2>", result.target);
         }
-        
+
         if result.open_count() == 0 {
             println!("    <p>No open ports found.</p>");
         } else {
@@ -314,7 +328,7 @@ pub fn print_html_multi(spec: &str, results: &[ScanResult], elapsed: Duration) {
             println!("        </tr>");
             println!("      </thead>");
             println!("      <tbody>");
-            
+
             for p in result.open_ports() {
                 println!("        <tr>");
                 let proto_str = match p.protocol {
@@ -322,14 +336,17 @@ pub fn print_html_multi(spec: &str, results: &[ScanResult], elapsed: Duration) {
                     crate::service::Transport::Udp => "udp",
                     crate::service::Transport::TcpUdp => "tcp/udp",
                 };
-                print!("          <td><span class=\"badge-open\">{}/{}</span>", p.port, proto_str);
+                print!(
+                    "          <td><span class=\"badge-open\">{}/{}</span>",
+                    p.port, proto_str
+                );
                 if p.tls {
                     print!("<span class=\"badge-tls\">TLS</span>");
                 }
                 println!("</td>");
-                
+
                 println!("          <td>{}</td>", p.service.name);
-                
+
                 print!("          <td>");
                 if let Some(ref banner) = p.banner {
                     // Primitive escaping for HTML
@@ -341,11 +358,11 @@ pub fn print_html_multi(spec: &str, results: &[ScanResult], elapsed: Duration) {
                 println!("</td>");
                 println!("        </tr>");
             }
-            
+
             println!("      </tbody>");
             println!("    </table>");
         }
-        
+
         println!("  </div>");
     }
 

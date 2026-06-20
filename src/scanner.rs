@@ -71,7 +71,6 @@
 ///     • On Linux the default is 1 024 FDs per process.  Set to 65 535 with
 ///       `ulimit -n 65535` before running for maximum throughput.
 ///     • Windows has a higher default (~16 000 concurrent sockets).
-
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -145,9 +144,9 @@ pub struct ScanResult {
 impl ScanResult {
     /// Iterator over only the open ports.
     pub fn open_ports(&self) -> impl Iterator<Item = &PortResult> {
-        self.ports.iter().filter(|r| {
-            r.status == PortStatus::Open || r.status == PortStatus::OpenFiltered
-        })
+        self.ports
+            .iter()
+            .filter(|r| r.status == PortStatus::Open || r.status == PortStatus::OpenFiltered)
     }
 
     /// Count of open ports discovered.
@@ -165,7 +164,7 @@ impl ScanResult {
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
     /// The target IP address.
-    pub addr:        IpAddr,
+    pub addr: IpAddr,
     /// First port to probe (inclusive).
     pub start_port: u16,
     /// Last port to probe (inclusive).
@@ -244,7 +243,15 @@ async fn probe_tcp(
     timeout_dur: Duration,
     do_banner: bool,
     do_tls: bool,
-) -> Result<(PortStatus, Option<String>, bool, Option<crate::tls::TlsCertInfo>), RustScanError> {
+) -> Result<
+    (
+        PortStatus,
+        Option<String>,
+        bool,
+        Option<crate::tls::TlsCertInfo>,
+    ),
+    RustScanError,
+> {
     let port = socket_addr.port();
     match timeout(timeout_dur, TcpStream::connect(socket_addr)).await {
         Err(_) => {
@@ -273,7 +280,9 @@ async fn probe_tcp(
                     trace!(port, "closed (RST)");
                     Ok((PortStatus::Closed, None, false, None))
                 }
-                ErrorKind::TimedOut | ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
+                ErrorKind::TimedOut
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable => {
                     trace!(port, "filtered (unreachable)");
                     Ok((PortStatus::Filtered, None, false, None))
                 }
@@ -293,14 +302,26 @@ async fn probe_tcp(
 async fn probe_udp(
     socket_addr: SocketAddr,
     timeout_dur: Duration,
-) -> Result<(PortStatus, Option<String>, bool, Option<crate::tls::TlsCertInfo>), RustScanError> {
+) -> Result<
+    (
+        PortStatus,
+        Option<String>,
+        bool,
+        Option<crate::tls::TlsCertInfo>,
+    ),
+    RustScanError,
+> {
     let port = socket_addr.port();
-    
+
     // Bind an ephemeral UDP port
-    let bind_addr = if socket_addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-    let socket = UdpSocket::bind(bind_addr).await.map_err(|e| {
-        RustScanError::Io(io::Error::new(e.kind(), format!("udp bind: {e}")))
-    })?;
+    let bind_addr = if socket_addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|e| RustScanError::Io(io::Error::new(e.kind(), format!("udp bind: {e}"))))?;
 
     // Connect to the target port so errors bubble up on recv
     if let Err(e) = socket.connect(socket_addr).await {
@@ -386,8 +407,12 @@ async fn probe_udp(
 pub async fn scan_host(config: Arc<ScanConfig>) -> Result<ScanResult, RustScanError> {
     let start_time = std::time::Instant::now();
     let mut protocols = Vec::new();
-    if config.tcp { protocols.push(Transport::Tcp); }
-    if config.udp { protocols.push(Transport::Udp); }
+    if config.tcp {
+        protocols.push(Transport::Tcp);
+    }
+    if config.udp {
+        protocols.push(Transport::Udp);
+    }
     if protocols.is_empty() {
         protocols.push(Transport::Tcp); // fallback
     }
@@ -420,9 +445,8 @@ pub async fn scan_host(config: Arc<ScanConfig>) -> Result<ScanResult, RustScanEr
     // handles have the same type, so `FuturesUnordered` needs no type
     // erasure.  The handle is cheap (~32 bytes); the full task state is
     // heap-allocated by Tokio's runtime.
-    let mut handles: FuturesUnordered<
-        JoinHandle<Result<PortResult, RustScanError>>,
-    > = FuturesUnordered::new();
+    let mut handles: FuturesUnordered<JoinHandle<Result<PortResult, RustScanError>>> =
+        FuturesUnordered::new();
 
     // ── Spawning loop ─────────────────────────────────────────────────────
     //
@@ -441,24 +465,23 @@ pub async fn scan_host(config: Arc<ScanConfig>) -> Result<ScanResult, RustScanEr
                 .await
                 .expect("semaphore closed unexpectedly — this is a bug");
 
-            let addr        = config.addr;
+            let addr = config.addr;
             let timeout_dur = config.timeout;
 
-            let do_banner   = config.banner;
-            let do_tls      = config.tls;
+            let do_banner = config.banner;
+            let do_tls = config.tls;
 
             // `tokio::spawn` requires all captured values to be `'static + Send`.
             // `addr` is `Copy`, `port` is `Copy`, `timeout_dur` is `Copy`,
             // `permit` is `OwnedSemaphorePermit: Send + 'static`.  ✓
-            let handle: JoinHandle<Result<PortResult, RustScanError>> =
-                tokio::spawn(async move {
-                    let result = scan_port(addr, port, protocol, timeout_dur, do_banner, do_tls).await;
-                    // Release the FD slot explicitly before the task exits.
-                    // Rust would drop `permit` at end-of-scope anyway, but the
-                    // explicit call makes the ordering visible in reviews.
-                    drop(permit);
-                    result
-                });
+            let handle: JoinHandle<Result<PortResult, RustScanError>> = tokio::spawn(async move {
+                let result = scan_port(addr, port, protocol, timeout_dur, do_banner, do_tls).await;
+                // Release the FD slot explicitly before the task exits.
+                // Rust would drop `permit` at end-of-scope anyway, but the
+                // explicit call makes the ordering visible in reviews.
+                drop(permit);
+                result
+            });
 
             handles.push(handle);
         }
@@ -485,8 +508,7 @@ pub async fn scan_host(config: Arc<ScanConfig>) -> Result<ScanResult, RustScanEr
             // The spawned task panicked.  This should never happen — if it
             // does it is a bug in scan_port, not a network condition.
             Err(join_err) => {
-                return Err(RustScanError::Io(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(RustScanError::Io(io::Error::other(
                     format!("probe task panicked: {join_err}"),
                 )));
             }
@@ -520,7 +542,7 @@ pub async fn scan_host(config: Arc<ScanConfig>) -> Result<ScanResult, RustScanEr
     };
 
     Ok(ScanResult {
-        target:      config.addr.to_string(),
+        target: config.addr.to_string(),
         hostname,
         total_ports,
         elapsed,
@@ -563,9 +585,16 @@ mod tests {
     #[tokio::test]
     async fn unreachable_address_returns_filtered() {
         let test_net: IpAddr = "192.0.2.1".parse().unwrap();
-        let result = scan_port(test_net, 80, Transport::Tcp, Duration::from_millis(100), false, false)
-            .await
-            .unwrap();
+        let result = scan_port(
+            test_net,
+            80,
+            Transport::Tcp,
+            Duration::from_millis(100),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.port, 80);
         assert_eq!(result.status, PortStatus::Filtered);
@@ -592,19 +621,19 @@ mod tests {
 
     fn make_result(statuses: &[(u16, PortStatus)]) -> ScanResult {
         ScanResult {
-            target:      "127.0.0.1".to_string(),
-            hostname:    None,
+            target: "127.0.0.1".to_string(),
+            hostname: None,
             total_ports: statuses.len() as u32,
             elapsed: Duration::from_millis(1),
             ports: statuses
                 .iter()
                 .map(|(p, s)| PortResult {
-                    port:     *p,
+                    port: *p,
                     protocol: Transport::Tcp,
-                    status:   s.clone(),
-                    service:  detect_service(*p, Transport::Tcp),
-                    banner:   None,
-                    tls:      false,
+                    status: s.clone(),
+                    service: detect_service(*p, Transport::Tcp),
+                    banner: None,
+                    tls: false,
                     tls_cert: None,
                 })
                 .collect(),
@@ -614,9 +643,9 @@ mod tests {
     #[test]
     fn open_count_counts_only_open_ports() {
         let scan = make_result(&[
-            (22,   PortStatus::Open),
-            (80,   PortStatus::Open),
-            (443,  PortStatus::Closed),
+            (22, PortStatus::Open),
+            (80, PortStatus::Open),
+            (443, PortStatus::Closed),
             (8080, PortStatus::Filtered),
         ]);
         assert_eq!(scan.open_count(), 2);
@@ -625,8 +654,8 @@ mod tests {
     #[test]
     fn open_ports_iter_filters_correctly() {
         let scan = make_result(&[
-            (22,  PortStatus::Open),
-            (80,  PortStatus::Closed),
+            (22, PortStatus::Open),
+            (80, PortStatus::Closed),
             (443, PortStatus::Open),
         ]);
         let open: Vec<u16> = scan.open_ports().map(|r| r.port).collect();
@@ -641,15 +670,15 @@ mod tests {
     #[tokio::test]
     async fn scan_host_completes_on_localhost() {
         let config = Arc::new(ScanConfig {
-            addr:        IpAddr::V4(Ipv4Addr::LOCALHOST),
-            start_port:  1,
-            end_port:    10,
-            timeout:     Duration::from_millis(200),
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            start_port: 1,
+            end_port: 10,
+            timeout: Duration::from_millis(200),
             concurrency: 10,
-            banner:      false,
-            tls:         false,
-            tcp:         true,
-            udp:         false,
+            banner: false,
+            tls: false,
+            tcp: true,
+            udp: false,
             resolve_dns: false,
         });
 
@@ -667,15 +696,15 @@ mod tests {
     #[tokio::test]
     async fn semaphore_cap_does_not_skip_ports() {
         let config = Arc::new(ScanConfig {
-            addr:        IpAddr::V4(Ipv4Addr::LOCALHOST),
-            start_port:  1,
-            end_port:    5,
-            timeout:     Duration::from_millis(100),
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            start_port: 1,
+            end_port: 5,
+            timeout: Duration::from_millis(100),
             concurrency: 2, // low concurrency to force queueing
-            banner:      false,
-            tls:         false,
-            tcp:         true,
-            udp:         false,
+            banner: false,
+            tls: false,
+            tcp: true,
+            udp: false,
             resolve_dns: false,
         });
 
@@ -694,15 +723,15 @@ mod tests {
         let sem = Arc::new(Semaphore::new(CONCURRENCY));
 
         let config = Arc::new(ScanConfig {
-            addr:        IpAddr::V4(Ipv4Addr::LOCALHOST),
-            start_port:  1,
-            end_port:    20,
-            timeout:     Duration::from_millis(300),
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            start_port: 1,
+            end_port: 20,
+            timeout: Duration::from_millis(300),
             concurrency: CONCURRENCY,
-            banner:      false,
-            tls:         false,
-            tcp:         true,
-            udp:         false,
+            banner: false,
+            tls: false,
+            tcp: true,
+            udp: false,
             resolve_dns: false,
         });
 
@@ -721,15 +750,15 @@ mod tests {
     #[tokio::test]
     async fn results_are_sorted_by_port() {
         let config = Arc::new(ScanConfig {
-            addr:        IpAddr::V4(Ipv4Addr::LOCALHOST),
-            start_port:  1,
-            end_port:    50,
-            timeout:     Duration::from_millis(300),
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            start_port: 1,
+            end_port: 50,
+            timeout: Duration::from_millis(300),
             concurrency: 25,
-            banner:      false,
-            tls:         false,
-            tcp:         true,
-            udp:         false,
+            banner: false,
+            tls: false,
+            tcp: true,
+            udp: false,
             resolve_dns: false,
         });
 
