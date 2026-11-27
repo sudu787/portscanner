@@ -45,7 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"]
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dns-lookup = "3.0.1"
+dns-lookup = "4.0.2"
 x509-parser = "0.18.1"
 csv = "1.3"
 # `config` (askama.toml support) is unused and pulls in unmaintained basic-toml.
