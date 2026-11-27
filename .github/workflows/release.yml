@@ -2,9 +2,19 @@ name: Release
 
 # Push a tag like `v0.2.0` to build binaries for every platform, publish a
 # GitHub Release with checksums, and push a multi-arch image to GHCR.
+#
+# Dry run: any branch push that touches the build configuration runs the
+# same verify + 6-target build (artifacts uploaded), but the `publish` and
+# `docker` jobs only run for tags — so a release can't silently rot.
 on:
   push:
     tags: ["v*.*.*"]
+    branches: ["**"]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - Dockerfile
+      - .github/workflows/release.yml
   workflow_dispatch:
 
 permissions:
