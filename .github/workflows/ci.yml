@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Every branch push gets the full pipeline (not just main), so problems
+  # show up before a PR is even opened.
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
