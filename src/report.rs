@@ -24,7 +24,7 @@ pub fn generate_html_report(
 ) -> Result<()> {
     // 1. Calculate Summary Stats
     let total_hosts = results.len();
-    let total_open_ports: usize = results.iter().map(|r| r.open_ports().count()).sum();
+    let total_open_ports: usize = results.iter().map(|r| r.open_count()).sum();
     let elapsed = format!("{:.2}s", total_elapsed.as_secs_f64());
 
     // Format UTC time (simple manual format since we don't have chrono)
@@ -36,17 +36,7 @@ pub fn generate_html_report(
         + " UNIX epoch";
 
     // 2. Flatten records for the table using our existing export struct
-    let mut records = Vec::new();
-    for r in results {
-        let ip_str = r.target.to_string();
-        for p in r.open_ports() {
-            records.push(ExportRecord::from_scan_result(
-                &ip_str,
-                r.hostname.as_ref(),
-                p,
-            ));
-        }
-    }
+    let records = crate::export::flatten_results(results);
 
     // 3. Render Askama Template
     let template = ReportTemplate {
@@ -58,9 +48,9 @@ pub fn generate_html_report(
         _phantom: std::marker::PhantomData,
     };
 
-    let html_string = template.render().map_err(|e| {
-        RustScanError::Io(std::io::Error::other(e.to_string()))
-    })?;
+    let html_string = template
+        .render()
+        .map_err(|e| RustScanError::Io(std::io::Error::other(e.to_string())))?;
 
     // 4. Save to Disk or Stdout
     if path.is_empty() {

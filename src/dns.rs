@@ -1,36 +1,56 @@
 use std::net::IpAddr;
+use std::time::Duration;
+
 use tokio::task::spawn_blocking;
+use tokio::time::timeout;
 use tracing::debug;
 
-/// Attempts a reverse DNS lookup to find the hostname associated with an IP address.
-///
-/// Because reverse DNS relies on OS-level `getnameinfo` (which is blocking),
-/// this function offloads the work to a `tokio::task::spawn_blocking` thread
-/// to prevent stalling the async executor.
-///
-/// Returns `Some(hostname)` if a PTR record exists and resolves successfully.
-/// Returns `None` if the lookup fails or times out (handled by the OS).
+use crate::probes::sanitize;
+
+/// OS resolvers can retry for a long time; one slow PTR must not stall a scan.
+const RDNS_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Reverse DNS (PTR) lookup on the blocking pool, with a hard timeout.
+/// The name is sanitized: PTR records are controlled by whoever owns the IP.
 pub async fn reverse_dns(ip: IpAddr) -> Option<String> {
-    debug!(target = %ip, "attempting reverse DNS lookup");
-
-    let handle = spawn_blocking(move || {
-        dns_lookup::lookup_addr(&ip).ok()
-    });
-
-    match handle.await {
-        Ok(Some(hostname)) => {
-            debug!(target = %ip, resolved = %hostname, "reverse DNS successful");
-            Some(hostname)
+    let lookup = spawn_blocking(move || dns_lookup::lookup_addr(&ip).ok());
+    match timeout(RDNS_TIMEOUT, lookup).await {
+        Ok(Ok(Some(name))) => {
+            let name = sanitize(&name);
+            // getnameinfo echoes the IP back when there is no PTR record.
+            (!name.is_empty() && name != ip.to_string()).then_some(name)
         }
-        Ok(None) => {
-            debug!(target = %ip, "reverse DNS failed (no PTR record)");
-            None
-        }
-        Err(e) => {
-            debug!(target = %ip, error = %e, "spawn_blocking failed for reverse DNS");
+        _ => {
+            debug!(target = %ip, "reverse DNS: no answer");
             None
         }
     }
+}
+
+/// Forward-resolve a hostname to all its addresses (IPv4 first, then IPv6),
+/// de-duplicated, preserving resolver order within each family.
+pub async fn resolve_host(host: &str) -> std::io::Result<Vec<IpAddr>> {
+    let lookup = format!("{host}:0");
+    let addrs = spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        lookup
+            .to_socket_addrs()
+            .map(|it| it.map(|sa| sa.ip()).collect::<Vec<_>>())
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    let mut out: Vec<IpAddr> = Vec::new();
+    for ip in addrs
+        .iter()
+        .filter(|a| a.is_ipv4())
+        .chain(addrs.iter().filter(|a| a.is_ipv6()))
+    {
+        if !out.contains(ip) {
+            out.push(*ip);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -39,23 +59,23 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[tokio::test]
-    async fn reverse_dns_localhost() {
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let hostname = reverse_dns(ip).await;
-        // Depending on the OS, this might resolve to "localhost" or something similar.
-        // It should at least not panic.
-        if let Some(h) = hostname {
+    async fn reverse_dns_localhost_does_not_panic() {
+        if let Some(h) = reverse_dns(IpAddr::V4(Ipv4Addr::LOCALHOST)).await {
             assert!(!h.is_empty());
         }
     }
 
     #[tokio::test]
+    async fn resolve_localhost() {
+        let addrs = resolve_host("localhost").await.unwrap();
+        assert!(addrs.iter().any(|a| a.is_loopback()));
+    }
+
+    /// Needs internet access; run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
     async fn reverse_dns_google_dns() {
-        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        let hostname = reverse_dns(ip).await;
-        // Typically resolves to "dns.google"
-        if let Some(h) = hostname {
-            assert!(h.contains("google") || h.contains("dns"));
-        }
+        let h = reverse_dns("8.8.8.8".parse().unwrap()).await.unwrap();
+        assert!(h.contains("google") || h.contains("dns"));
     }
 }

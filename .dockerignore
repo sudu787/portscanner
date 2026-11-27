@@ -1,0 +1,8 @@
+target/
+.git/
+.github/
+.cargo/
+*.json
+*.csv
+*.html
+!templates/*.html
