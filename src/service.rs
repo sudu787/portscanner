@@ -31,7 +31,6 @@
 /// (banner grabbing).  A port-based guess is fast but can be wrong:
 /// an admin might run HTTP on port 9999 or SSH on port 2222.
 /// The output layer should always label this data as "likely" or "typical".
-
 use serde::Serialize;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -65,12 +64,12 @@ pub struct ServiceInfo {
 
 impl ServiceInfo {
     // Private constructor — all instances are created inside `detect_service`.
-    const fn new(
-        name: &'static str,
-        transport: Transport,
-        description: &'static str,
-    ) -> Self {
-        Self { name, transport, description }
+    const fn new(name: &'static str, transport: Transport, description: &'static str) -> Self {
+        Self {
+            name,
+            transport,
+            description,
+        }
     }
 
     /// Returns `true` if this port is in the well-known service database.
@@ -119,182 +118,186 @@ pub fn detect_service(port: u16, target_proto: Transport) -> ServiceInfo {
         // ── Well-known ports (0–1023) ──────────────────────────────────────
 
         //  20 — FTP data channel (active mode)
-        20  => ServiceInfo::new("FTP-DATA",    Tcp,    "File Transfer Protocol — data channel"),
+        20 => ServiceInfo::new("FTP-DATA", Tcp, "File Transfer Protocol — data channel"),
         //  21 — FTP control channel
-        21  => ServiceInfo::new("FTP",         Tcp,    "File Transfer Protocol — control"),
+        21 => ServiceInfo::new("FTP", Tcp, "File Transfer Protocol — control"),
         //  22 — Secure Shell
-        22  => ServiceInfo::new("SSH",         Tcp,    "Secure Shell — encrypted remote login"),
+        22 => ServiceInfo::new("SSH", Tcp, "Secure Shell — encrypted remote login"),
         //  23 — Telnet (plaintext, legacy)
-        23  => ServiceInfo::new("TELNET",      Tcp,    "Telnet — unencrypted remote login (legacy)"),
+        23 => ServiceInfo::new("TELNET", Tcp, "Telnet — unencrypted remote login (legacy)"),
         //  25 — SMTP mail submission between servers
-        25  => ServiceInfo::new("SMTP",        Tcp,    "Simple Mail Transfer Protocol"),
+        25 => ServiceInfo::new("SMTP", Tcp, "Simple Mail Transfer Protocol"),
         //  53 — DNS (small queries UDP; zone transfers TCP)
-        53  => ServiceInfo::new("DNS",         TcpUdp, "Domain Name System"),
+        53 => ServiceInfo::new("DNS", TcpUdp, "Domain Name System"),
         //  67 — DHCP server
-        67  => ServiceInfo::new("DHCP",        Udp,    "Dynamic Host Configuration Protocol — server"),
+        67 => ServiceInfo::new("DHCP", Udp, "Dynamic Host Configuration Protocol — server"),
         //  68 — DHCP client
-        68  => ServiceInfo::new("DHCP-CLIENT", Udp,    "Dynamic Host Configuration Protocol — client"),
+        68 => ServiceInfo::new(
+            "DHCP-CLIENT",
+            Udp,
+            "Dynamic Host Configuration Protocol — client",
+        ),
         //  69 — Trivial FTP (firmware upgrades, PXE boot)
-        69  => ServiceInfo::new("TFTP",        Udp,    "Trivial File Transfer Protocol"),
+        69 => ServiceInfo::new("TFTP", Udp, "Trivial File Transfer Protocol"),
         //  80 — HTTP
-        80  => ServiceInfo::new("HTTP",        Tcp,    "HyperText Transfer Protocol"),
+        80 => ServiceInfo::new("HTTP", Tcp, "HyperText Transfer Protocol"),
         //  88 — Kerberos authentication
-        88  => ServiceInfo::new("KERBEROS",    TcpUdp, "Kerberos authentication"),
+        88 => ServiceInfo::new("KERBEROS", TcpUdp, "Kerberos authentication"),
         //  110 — POP3 mail retrieval
-        110 => ServiceInfo::new("POP3",        Tcp,    "Post Office Protocol v3"),
+        110 => ServiceInfo::new("POP3", Tcp, "Post Office Protocol v3"),
         //  111 — ONC RPC portmapper
-        111 => ServiceInfo::new("RPCBIND",     TcpUdp, "ONC RPC portmapper"),
+        111 => ServiceInfo::new("RPCBIND", TcpUdp, "ONC RPC portmapper"),
         //  119 — NNTP (Usenet)
-        119 => ServiceInfo::new("NNTP",        Tcp,    "Network News Transfer Protocol"),
+        119 => ServiceInfo::new("NNTP", Tcp, "Network News Transfer Protocol"),
         //  123 — NTP time sync (UDP only in practice)
-        123 => ServiceInfo::new("NTP",         Udp,    "Network Time Protocol"),
+        123 => ServiceInfo::new("NTP", Udp, "Network Time Protocol"),
         //  135 — Windows RPC endpoint mapper
-        135 => ServiceInfo::new("MSRPC",       Tcp,    "Microsoft RPC endpoint mapper"),
+        135 => ServiceInfo::new("MSRPC", Tcp, "Microsoft RPC endpoint mapper"),
         //  137 — NetBIOS name service
-        137 => ServiceInfo::new("NETBIOS-NS",  TcpUdp, "NetBIOS Name Service"),
+        137 => ServiceInfo::new("NETBIOS-NS", TcpUdp, "NetBIOS Name Service"),
         //  138 — NetBIOS datagram service
-        138 => ServiceInfo::new("NETBIOS-DGM", Udp,    "NetBIOS Datagram Service"),
+        138 => ServiceInfo::new("NETBIOS-DGM", Udp, "NetBIOS Datagram Service"),
         //  139 — NetBIOS session service (SMB over NetBIOS)
-        139 => ServiceInfo::new("NETBIOS-SSN", Tcp,    "NetBIOS Session Service"),
+        139 => ServiceInfo::new("NETBIOS-SSN", Tcp, "NetBIOS Session Service"),
         //  143 — IMAP email access
-        143 => ServiceInfo::new("IMAP",        Tcp,    "Internet Message Access Protocol"),
+        143 => ServiceInfo::new("IMAP", Tcp, "Internet Message Access Protocol"),
         //  161 — SNMP agent (UDP)
-        161 => ServiceInfo::new("SNMP",        Udp,    "Simple Network Management Protocol — agent"),
+        161 => ServiceInfo::new("SNMP", Udp, "Simple Network Management Protocol — agent"),
         //  162 — SNMP trap receiver
-        162 => ServiceInfo::new("SNMPTRAP",    Udp,    "Simple Network Management Protocol — trap"),
+        162 => ServiceInfo::new("SNMPTRAP", Udp, "Simple Network Management Protocol — trap"),
         //  179 — BGP inter-AS routing
-        179 => ServiceInfo::new("BGP",         Tcp,    "Border Gateway Protocol"),
+        179 => ServiceInfo::new("BGP", Tcp, "Border Gateway Protocol"),
         //  194 — IRC
-        194 => ServiceInfo::new("IRC",         TcpUdp, "Internet Relay Chat"),
+        194 => ServiceInfo::new("IRC", TcpUdp, "Internet Relay Chat"),
         //  389 — LDAP directory
-        389 => ServiceInfo::new("LDAP",        TcpUdp, "Lightweight Directory Access Protocol"),
+        389 => ServiceInfo::new("LDAP", TcpUdp, "Lightweight Directory Access Protocol"),
         //  443 — HTTPS
-        443 => ServiceInfo::new("HTTPS",       Tcp,    "HTTP over TLS/SSL"),
+        443 => ServiceInfo::new("HTTPS", Tcp, "HTTP over TLS/SSL"),
         //  445 — SMB direct (Windows file/printer sharing)
-        445 => ServiceInfo::new("SMB",         Tcp,    "Server Message Block — Windows file sharing"),
+        445 => ServiceInfo::new("SMB", Tcp, "Server Message Block — Windows file sharing"),
         //  465 — SMTPS (SMTP over TLS — legacy port)
-        465 => ServiceInfo::new("SMTPS",       Tcp,    "SMTP over TLS (legacy)"),
+        465 => ServiceInfo::new("SMTPS", Tcp, "SMTP over TLS (legacy)"),
         //  514 — Syslog (UDP); RSH (TCP) — context-dependent
-        514 => ServiceInfo::new("SYSLOG",      Udp,    "System log / Remote Shell"),
+        514 => ServiceInfo::new("SYSLOG", Udp, "System log / Remote Shell"),
         //  515 — LPD print spooler
-        515 => ServiceInfo::new("LPD",         Tcp,    "Line Printer Daemon"),
+        515 => ServiceInfo::new("LPD", Tcp, "Line Printer Daemon"),
         //  587 — SMTP mail submission (client → server)
-        587 => ServiceInfo::new("SUBMISSION",  Tcp,    "SMTP mail submission (RFC 6409)"),
+        587 => ServiceInfo::new("SUBMISSION", Tcp, "SMTP mail submission (RFC 6409)"),
         //  631 — IPP (CUPS printing)
-        631 => ServiceInfo::new("IPP",         TcpUdp, "Internet Printing Protocol (CUPS)"),
+        631 => ServiceInfo::new("IPP", TcpUdp, "Internet Printing Protocol (CUPS)"),
         //  636 — LDAPS (LDAP over TLS)
-        636 => ServiceInfo::new("LDAPS",       Tcp,    "LDAP over TLS/SSL"),
+        636 => ServiceInfo::new("LDAPS", Tcp, "LDAP over TLS/SSL"),
         //  873 — rsync
-        873 => ServiceInfo::new("RSYNC",       Tcp,    "rsync file synchronisation"),
+        873 => ServiceInfo::new("RSYNC", Tcp, "rsync file synchronisation"),
         //  902 — VMware ESXi / Workstation authentication
-        902 => ServiceInfo::new("VMWARE",      Tcp,    "VMware ESXi / Workstation"),
+        902 => ServiceInfo::new("VMWARE", Tcp, "VMware ESXi / Workstation"),
         //  989 — FTPS data (FTP over TLS)
-        989 => ServiceInfo::new("FTPS-DATA",   Tcp,    "FTP over TLS — data channel"),
+        989 => ServiceInfo::new("FTPS-DATA", Tcp, "FTP over TLS — data channel"),
         //  990 — FTPS control (FTP over TLS)
-        990 => ServiceInfo::new("FTPS",        Tcp,    "FTP over TLS — control channel"),
+        990 => ServiceInfo::new("FTPS", Tcp, "FTP over TLS — control channel"),
         //  993 — IMAPS (IMAP over TLS)
-        993 => ServiceInfo::new("IMAPS",       Tcp,    "IMAP over TLS/SSL"),
+        993 => ServiceInfo::new("IMAPS", Tcp, "IMAP over TLS/SSL"),
         //  995 — POP3S (POP3 over TLS)
-        995 => ServiceInfo::new("POP3S",       Tcp,    "POP3 over TLS/SSL"),
+        995 => ServiceInfo::new("POP3S", Tcp, "POP3 over TLS/SSL"),
 
         // ── Registered ports (1024–49151) ─────────────────────────────────
 
         //  1080 — SOCKS proxy
-        1080  => ServiceInfo::new("SOCKS",        Tcp, "SOCKS proxy"),
+        1080 => ServiceInfo::new("SOCKS", Tcp, "SOCKS proxy"),
         //  1194 — OpenVPN
-        1194  => ServiceInfo::new("OPENVPN",       TcpUdp, "OpenVPN"),
+        1194 => ServiceInfo::new("OPENVPN", TcpUdp, "OpenVPN"),
         //  1433 — Microsoft SQL Server
-        1433  => ServiceInfo::new("MSSQL",         Tcp, "Microsoft SQL Server"),
+        1433 => ServiceInfo::new("MSSQL", Tcp, "Microsoft SQL Server"),
         //  1521 — Oracle Database listener
-        1521  => ServiceInfo::new("ORACLE-DB",     Tcp, "Oracle Database listener"),
+        1521 => ServiceInfo::new("ORACLE-DB", Tcp, "Oracle Database listener"),
         //  1723 — PPTP VPN
-        1723  => ServiceInfo::new("PPTP",          Tcp, "Point-to-Point Tunnelling Protocol"),
+        1723 => ServiceInfo::new("PPTP", Tcp, "Point-to-Point Tunnelling Protocol"),
         //  2049 — NFS
-        2049  => ServiceInfo::new("NFS",           TcpUdp, "Network File System"),
+        2049 => ServiceInfo::new("NFS", TcpUdp, "Network File System"),
         //  2181 — Apache ZooKeeper client port
-        2181  => ServiceInfo::new("ZOOKEEPER",     Tcp, "Apache ZooKeeper — client"),
+        2181 => ServiceInfo::new("ZOOKEEPER", Tcp, "Apache ZooKeeper — client"),
         //  2375 — Docker daemon (unencrypted — dangerous if exposed)
-        2375  => ServiceInfo::new("DOCKER",        Tcp, "Docker daemon — UNENCRYPTED, high risk"),
+        2375 => ServiceInfo::new("DOCKER", Tcp, "Docker daemon — UNENCRYPTED, high risk"),
         //  2376 — Docker daemon (TLS)
-        2376  => ServiceInfo::new("DOCKER-TLS",    Tcp, "Docker daemon over TLS"),
+        2376 => ServiceInfo::new("DOCKER-TLS", Tcp, "Docker daemon over TLS"),
         //  2379 — etcd client API (Kubernetes control plane)
-        2379  => ServiceInfo::new("ETCD",          Tcp, "etcd client API"),
+        2379 => ServiceInfo::new("ETCD", Tcp, "etcd client API"),
         //  2380 — etcd peer communication
-        2380  => ServiceInfo::new("ETCD-PEER",     Tcp, "etcd peer communication"),
+        2380 => ServiceInfo::new("ETCD-PEER", Tcp, "etcd peer communication"),
         //  3000 — Grafana / common dev server port
-        3000  => ServiceInfo::new("GRAFANA",       Tcp, "Grafana dashboards / dev HTTP server"),
+        3000 => ServiceInfo::new("GRAFANA", Tcp, "Grafana dashboards / dev HTTP server"),
         //  3306 — MySQL / MariaDB
-        3306  => ServiceInfo::new("MYSQL",         Tcp, "MySQL / MariaDB database"),
+        3306 => ServiceInfo::new("MYSQL", Tcp, "MySQL / MariaDB database"),
         //  3389 — Windows Remote Desktop Protocol
-        3389  => ServiceInfo::new("RDP",           Tcp, "Windows Remote Desktop Protocol"),
+        3389 => ServiceInfo::new("RDP", Tcp, "Windows Remote Desktop Protocol"),
         //  4369 — RabbitMQ Erlang port mapper (epmd)
-        4369  => ServiceInfo::new("EPMD",          Tcp, "Erlang Port Mapper Daemon (RabbitMQ)"),
+        4369 => ServiceInfo::new("EPMD", Tcp, "Erlang Port Mapper Daemon (RabbitMQ)"),
         //  5000 — Flask / UPnP
-        5000  => ServiceInfo::new("HTTP-ALT",      Tcp, "Common dev HTTP / UPnP"),
+        5000 => ServiceInfo::new("HTTP-ALT", Tcp, "Common dev HTTP / UPnP"),
         //  5040 — Windows User Data Access (WinRT)
-        5040  => ServiceInfo::new("WIN-UDA",       Tcp, "Windows User Data Access service"),
+        5040 => ServiceInfo::new("WIN-UDA", Tcp, "Windows User Data Access service"),
         //  5357 — WSDAPI (Windows device discovery)
-        5357  => ServiceInfo::new("WSDAPI",        Tcp, "Web Services for Devices (Windows)"),
+        5357 => ServiceInfo::new("WSDAPI", Tcp, "Web Services for Devices (Windows)"),
         //  5432 — PostgreSQL
-        5432  => ServiceInfo::new("POSTGRESQL",    Tcp, "PostgreSQL database"),
+        5432 => ServiceInfo::new("POSTGRESQL", Tcp, "PostgreSQL database"),
         //  5672 — RabbitMQ AMQP
-        5672  => ServiceInfo::new("AMQP",          Tcp, "RabbitMQ / AMQP message broker"),
+        5672 => ServiceInfo::new("AMQP", Tcp, "RabbitMQ / AMQP message broker"),
         //  5900 — VNC remote desktop
-        5900  => ServiceInfo::new("VNC",           Tcp, "Virtual Network Computing — remote desktop"),
+        5900 => ServiceInfo::new("VNC", Tcp, "Virtual Network Computing — remote desktop"),
         //  5984 — Apache CouchDB HTTP API
-        5984  => ServiceInfo::new("COUCHDB",       Tcp, "Apache CouchDB HTTP API"),
+        5984 => ServiceInfo::new("COUCHDB", Tcp, "Apache CouchDB HTTP API"),
         //  6379 — Redis in-memory store
-        6379  => ServiceInfo::new("REDIS",         Tcp, "Redis in-memory data store"),
+        6379 => ServiceInfo::new("REDIS", Tcp, "Redis in-memory data store"),
         //  6443 — Kubernetes API server
-        6443  => ServiceInfo::new("KUBE-API",      Tcp, "Kubernetes API server (TLS)"),
+        6443 => ServiceInfo::new("KUBE-API", Tcp, "Kubernetes API server (TLS)"),
         //  7001 — Oracle WebLogic
-        7001  => ServiceInfo::new("WEBLOGIC",      Tcp, "Oracle WebLogic Server"),
+        7001 => ServiceInfo::new("WEBLOGIC", Tcp, "Oracle WebLogic Server"),
         //  7680 — Windows Delivery Optimization P2P
-        7680  => ServiceInfo::new("WIN-DO",        Tcp, "Windows Update Delivery Optimisation"),
+        7680 => ServiceInfo::new("WIN-DO", Tcp, "Windows Update Delivery Optimisation"),
         //  8080 — HTTP alternate (proxy, dev servers, Tomcat)
-        8080  => ServiceInfo::new("HTTP-PROXY",    Tcp, "HTTP alternate / Tomcat / proxy"),
+        8080 => ServiceInfo::new("HTTP-PROXY", Tcp, "HTTP alternate / Tomcat / proxy"),
         //  8443 — HTTPS alternate
-        8443  => ServiceInfo::new("HTTPS-ALT",     Tcp, "HTTPS alternate port"),
+        8443 => ServiceInfo::new("HTTPS-ALT", Tcp, "HTTPS alternate port"),
         //  8888 — Jupyter Notebook
-        8888  => ServiceInfo::new("JUPYTER",       Tcp, "Jupyter Notebook / common HTTP alt"),
+        8888 => ServiceInfo::new("JUPYTER", Tcp, "Jupyter Notebook / common HTTP alt"),
         //  9000 — SonarQube / PHP-FPM
-        9000  => ServiceInfo::new("SONARQUBE",     Tcp, "SonarQube / PHP-FPM"),
+        9000 => ServiceInfo::new("SONARQUBE", Tcp, "SonarQube / PHP-FPM"),
         //  9090 — Prometheus metrics
-        9090  => ServiceInfo::new("PROMETHEUS",    Tcp, "Prometheus metrics server"),
+        9090 => ServiceInfo::new("PROMETHEUS", Tcp, "Prometheus metrics server"),
         //  9092 — Apache Kafka broker
-        9092  => ServiceInfo::new("KAFKA",         Tcp, "Apache Kafka broker"),
+        9092 => ServiceInfo::new("KAFKA", Tcp, "Apache Kafka broker"),
         //  9200 — Elasticsearch HTTP API
-        9200  => ServiceInfo::new("ELASTICSEARCH", Tcp, "Elasticsearch HTTP API"),
+        9200 => ServiceInfo::new("ELASTICSEARCH", Tcp, "Elasticsearch HTTP API"),
         //  9300 — Elasticsearch cluster transport
-        9300  => ServiceInfo::new("ES-CLUSTER",    Tcp, "Elasticsearch cluster transport"),
+        9300 => ServiceInfo::new("ES-CLUSTER", Tcp, "Elasticsearch cluster transport"),
         //  9527 — VMware Horizon View (or app-specific)
-        9527  => ServiceInfo::new("VMWARE-VIEW",   Tcp, "VMware Horizon View / app-specific"),
+        9527 => ServiceInfo::new("VMWARE-VIEW", Tcp, "VMware Horizon View / app-specific"),
         //  10250 — Kubernetes kubelet API
-        10250 => ServiceInfo::new("KUBELET",       Tcp, "Kubernetes kubelet API"),
+        10250 => ServiceInfo::new("KUBELET", Tcp, "Kubernetes kubelet API"),
         //  10255 — Kubernetes kubelet read-only API (deprecated)
-        10255 => ServiceInfo::new("KUBELET-RO",    Tcp, "Kubernetes kubelet read-only (deprecated)"),
+        10255 => ServiceInfo::new(
+            "KUBELET-RO",
+            Tcp,
+            "Kubernetes kubelet read-only (deprecated)",
+        ),
         //  11211 — Memcached
-        11211 => ServiceInfo::new("MEMCACHED",     TcpUdp, "Memcached in-memory cache"),
+        11211 => ServiceInfo::new("MEMCACHED", TcpUdp, "Memcached in-memory cache"),
         //  15672 — RabbitMQ management UI
-        15672 => ServiceInfo::new("RABBITMQ-UI",   Tcp, "RabbitMQ management HTTP UI"),
+        15672 => ServiceInfo::new("RABBITMQ-UI", Tcp, "RabbitMQ management HTTP UI"),
         //  16443 — MicroK8s API server
-        16443 => ServiceInfo::new("MICROK8S",      Tcp, "MicroK8s Kubernetes API server"),
+        16443 => ServiceInfo::new("MICROK8S", Tcp, "MicroK8s Kubernetes API server"),
         //  27017 — MongoDB primary
-        27017 => ServiceInfo::new("MONGODB",       Tcp, "MongoDB database"),
+        27017 => ServiceInfo::new("MONGODB", Tcp, "MongoDB database"),
         //  27018 — MongoDB shard
         27018 => ServiceInfo::new("MONGODB-SHARD", Tcp, "MongoDB sharded cluster"),
         //  50000 — SAP Application Server
-        50000 => ServiceInfo::new("SAP",           Tcp, "SAP Application Server"),
+        50000 => ServiceInfo::new("SAP", Tcp, "SAP Application Server"),
 
         // ── Dynamic / ephemeral range hint ────────────────────────────────
         //  49152–65535 = IANA dynamic/private range.  These are typically
         //  OS-assigned ephemeral ports — valid connection endpoints but not
         //  associated with a named service.
-        49152..=65535 => ServiceInfo::new(
-            "EPHEMERAL",
-            Tcp,
-            "OS-assigned ephemeral / dynamic port",
-        ),
+        49152..=65535 => ServiceInfo::new("EPHEMERAL", Tcp, "OS-assigned ephemeral / dynamic port"),
 
         // ── Fallthrough ────────────────────────────────────────────────────
         _ => ServiceInfo::new("Unknown", TcpUdp, "No service mapping for this port"),
@@ -310,11 +313,85 @@ pub fn detect_service(port: u16, target_proto: Transport) -> ServiceInfo {
     }
 }
 
+/// Label for a port whose handshake proved TLS but whose service is unknown.
+pub const TLS_SERVICE: ServiceInfo = ServiceInfo::new(
+    "SSL/TLS",
+    Transport::Tcp,
+    "TLS-wrapped service (confirmed by handshake)",
+);
+
+// ─── identify_banner() ────────────────────────────────────────────────────────
+
+/// Identify the service from what it actually said, independent of the port.
+/// Returns `None` when the banner matches no known signature, in which case
+/// the port-based guess from [`detect_service`] stands.
+pub fn identify_banner(banner: &str, tls: bool) -> Option<ServiceInfo> {
+    use Transport::Tcp;
+    let b = banner.trim_start();
+    let lower = b.to_ascii_lowercase();
+    let has = |s: &str| lower.contains(s);
+
+    let info = if b.starts_with("SSH-") {
+        ServiceInfo::new("SSH", Tcp, "Secure Shell (from banner)")
+    } else if b.starts_with("HTTP/") {
+        if tls {
+            ServiceInfo::new("HTTPS", Tcp, "HTTP over TLS (from banner)")
+        } else {
+            ServiceInfo::new("HTTP", Tcp, "HTTP server (from banner)")
+        }
+    } else if b.starts_with("RTSP/") {
+        ServiceInfo::new("RTSP", Tcp, "Real Time Streaming Protocol (from banner)")
+    } else if b.starts_with("SIP/") {
+        ServiceInfo::new("SIP", Tcp, "Session Initiation Protocol (from banner)")
+    } else if b.starts_with("220") && (has("smtp") || has("mail")) {
+        ServiceInfo::new("SMTP", Tcp, "Mail server (from banner)")
+    } else if b.starts_with("220") && has("ftp") {
+        ServiceInfo::new("FTP", Tcp, "FTP server (from banner)")
+    } else if b.starts_with("+OK") {
+        ServiceInfo::new("POP3", Tcp, "POP3 mail server (from banner)")
+    } else if b.starts_with("* OK") || b.starts_with("* PREAUTH") {
+        ServiceInfo::new("IMAP", Tcp, "IMAP mail server (from banner)")
+    } else if b.starts_with("RFB ") {
+        ServiceInfo::new("VNC", Tcp, "VNC remote framebuffer (from banner)")
+    } else if b.starts_with("-ERR") || b.starts_with("-NOAUTH") || b.starts_with("-DENIED") {
+        ServiceInfo::new("REDIS", Tcp, "Redis key-value store (from banner)")
+    } else if b.starts_with("@RSYNCD") {
+        ServiceInfo::new("RSYNC", Tcp, "rsync daemon (from banner)")
+    } else if b.starts_with("AMQP") {
+        ServiceInfo::new("AMQP", Tcp, "AMQP message broker (from banner)")
+    } else if has("mysql") || has("mariadb") {
+        ServiceInfo::new("MYSQL", Tcp, "MySQL / MariaDB (from banner)")
+    } else if b.starts_with("220") {
+        ServiceInfo::new("FTP/SMTP", Tcp, "220 greeting — FTP or SMTP (from banner)")
+    } else {
+        return None;
+    };
+    Some(info)
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifies_services_from_banners() {
+        let id = |b: &str| identify_banner(b, false).map(|s| s.name);
+        assert_eq!(id("SSH-2.0-OpenSSH_9.6"), Some("SSH"));
+        assert_eq!(id("HTTP/1.1 200 OK | Server: nginx"), Some("HTTP"));
+        assert_eq!(
+            identify_banner("HTTP/1.1 200 OK", true).unwrap().name,
+            "HTTPS"
+        );
+        assert_eq!(id("220 mx.example.com ESMTP Postfix"), Some("SMTP"));
+        assert_eq!(id("220 (vsFTPd 3.0.5)"), Some("FTP"));
+        assert_eq!(id("+OK Dovecot ready."), Some("POP3"));
+        assert_eq!(id("* OK [CAPABILITY IMAP4rev1] ready"), Some("IMAP"));
+        assert_eq!(id("RFB 003.008"), Some("VNC"));
+        assert_eq!(id("-ERR unknown command 'HEAD'"), Some("REDIS"));
+        assert_eq!(id("hello world"), None);
+    }
 
     // ── Known ports ───────────────────────────────────────────────────────
 
@@ -398,7 +475,10 @@ mod tests {
 
     #[test]
     fn ntp_is_udp() {
-        assert_eq!(detect_service(123, Transport::Udp).transport, Transport::Udp);
+        assert_eq!(
+            detect_service(123, Transport::Udp).transport,
+            Transport::Udp
+        );
     }
 
     // ── Unknown / ephemeral ───────────────────────────────────────────────
@@ -467,7 +547,9 @@ mod tests {
 
     #[test]
     fn required_ports_all_known() {
-        let required = [21, 22, 25, 53, 80, 110, 143, 443, 445, 3306, 3389, 5432, 6379, 8080];
+        let required = [
+            21, 22, 25, 53, 80, 110, 143, 443, 445, 3306, 3389, 5432, 6379, 8080,
+        ];
         for port in required {
             let s = detect_service(port, Transport::Tcp);
             assert!(

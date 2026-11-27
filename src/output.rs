@@ -14,32 +14,47 @@ use anyhow::Result;
 use serde_json::{json, to_string_pretty};
 
 use crate::scanner::{PortStatus, ScanResult};
-use crate::targets::ResolvedTarget;
+
+// ─── Colours ──────────────────────────────────────────────────────────────────
+
+/// Colour only when writing to a terminal and `NO_COLOR` is unset
+/// (<https://no-color.org>). Piped or redirected output stays plain, so it
+/// works with grep/awk and in files.
+pub fn use_color(stream_is_terminal: bool) -> bool {
+    stream_is_terminal && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// `code` when colour is on, else "".
+pub fn paint(on: bool, code: &'static str) -> &'static str {
+    if on {
+        code
+    } else {
+        ""
+    }
+}
 
 // ─── Text Output ──────────────────────────────────────────────────────────────
 
-pub fn print_text_multi(
-    resolved: &ResolvedTarget,
-    results: &[ScanResult],
-    total_elapsed: Duration,
-) {
-    const BOLD: &str = "\x1b[1m";
-    const GREEN: &str = "\x1b[32m";
-    const RED: &str = "\x1b[31m";
-    const CYAN: &str = "\x1b[36m";
-    const YELLOW: &str = "\x1b[33m";
-    const DIM: &str = "\x1b[2m";
-    const RESET: &str = "\x1b[0m";
+#[allow(non_snake_case)]
+pub fn print_text_multi(label: &str, results: &[ScanResult], total_elapsed: Duration) {
+    use std::io::IsTerminal;
+    let on = use_color(std::io::stdout().is_terminal());
+    let (BOLD, GREEN, RED, CYAN, YELLOW, DIM, RESET) = (
+        paint(on, "\x1b[1m"),
+        paint(on, "\x1b[32m"),
+        paint(on, "\x1b[31m"),
+        paint(on, "\x1b[36m"),
+        paint(on, "\x1b[33m"),
+        paint(on, "\x1b[2m"),
+        paint(on, "\x1b[0m"),
+    );
 
     let multi = results.len() > 1;
 
     if multi {
         // ── Multi-host header ─────────────────────────────────────────────
         println!();
-        println!(
-            "{BOLD}{CYAN}Scan Results — {}{RESET}",
-            resolved.display_label()
-        );
+        println!("{BOLD}{CYAN}Scan Results — {}{RESET}", label);
         println!("{CYAN}══════════════════════════════════════════════════{RESET}");
         println!("  {YELLOW}Hosts scanned  :{RESET} {}", results.len());
         let hosts_with_open = results.iter().filter(|r| r.open_count() > 0).count();
@@ -72,12 +87,12 @@ pub fn print_text_multi(
             if let Some(h) = &result.hostname {
                 println!(
                     "{BOLD}{CYAN}Scan Results — {} ({} / {}){RESET}",
-                    resolved.spec, h, result.target
+                    label, h, result.target
                 );
             } else {
                 println!(
                     "{BOLD}{CYAN}Scan Results — {} ({}){RESET}",
-                    resolved.spec, result.target
+                    label, result.target
                 );
             }
         }
@@ -86,10 +101,20 @@ pub fn print_text_multi(
         println!("  {YELLOW}Ports scanned :{RESET} {}", result.total_ports);
         println!(
             "  {YELLOW}Open ports    :{RESET} {}{}{}",
-            if open.is_empty() { RED } else { GREEN },
-            open.len(),
+            if result.open_count() == 0 { RED } else { GREEN },
+            result.open_count(),
             RESET
         );
+        println!(
+            "  {YELLOW}Closed/filt.  :{RESET} {} / {}",
+            result.closed, result.filtered
+        );
+        if result.errors > 0 {
+            println!(
+                "  {YELLOW}Probe errors  :{RESET} {RED}{} (results incomplete){RESET}",
+                result.errors
+            );
+        }
         if !multi {
             println!(
                 "  {YELLOW}Elapsed       :{RESET} {:.2}s",
@@ -111,6 +136,11 @@ pub fn print_text_multi(
             for pr in &open {
                 let svc = pr.service;
                 let tls_marker = if pr.tls { "🔒" } else { " " };
+                let ambiguous = if pr.status == PortStatus::OpenFiltered {
+                    "(open|filtered) "
+                } else {
+                    ""
+                };
                 let desc = match &pr.banner {
                     Some(b) => format!("{}{RESET}", b), // Banner overrides description if present
                     None => format!(
@@ -126,11 +156,10 @@ pub fn print_text_multi(
                 };
 
                 println!(
-                    "    {GREEN}▶{RESET}  {BOLD}{:<8}{RESET} {}   {CYAN}{:<12}{RESET} {DIM}{}",
+                    "    {GREEN}▶{RESET}  {BOLD}{:<8}{RESET} {}   {CYAN}{:<12}{RESET} {DIM}{ambiguous}{desc}",
                     format!("{}/{}", pr.port, proto_str),
                     tls_marker,
                     svc.name,
-                    desc
                 );
 
                 // Print TLS Certificate if grabbed
@@ -139,6 +168,15 @@ pub fn print_text_multi(
                         "        {DIM}└─ TLS Cert: {} ({}) — Expires: {}{RESET}",
                         cert.subject, cert.issuer, cert.not_after
                     );
+                    if cert.expired {
+                        println!("        {RED}⚠  certificate is expired / not yet valid{RESET}");
+                    }
+                    if cert.self_signed {
+                        println!("        {YELLOW}⚠  certificate is self-signed{RESET}");
+                    }
+                }
+                if let Some(v) = pr.legacy_tls {
+                    println!("        {RED}⚠  accepts deprecated {v}{RESET}");
                 }
             }
         }
@@ -148,25 +186,32 @@ pub fn print_text_multi(
 
 // ─── JSON Output ──────────────────────────────────────────────────────────────
 
-pub fn print_json_multi(spec: &str, results: &[ScanResult], total_elapsed: Duration) -> Result<()> {
+/// `multi`: the user asked for more than one host (CIDR, several targets, `-L`).
+/// It picks the document shape, so the schema does not change when discovery
+/// happens to leave a single host up.
+pub fn print_json_multi(
+    spec: &str,
+    results: &[ScanResult],
+    total_elapsed: Duration,
+    multi: bool,
+) -> Result<()> {
     let host_docs: Vec<_> = results
         .iter()
         .map(|r| {
             let open_ports: Vec<u16> = r.open_ports().map(|p| p.port).collect();
-            let all_ports: Vec<_> = r
+            // Only open / open|filtered ports are retained; closed and
+            // filtered are reported as counts.
+            let ports: Vec<_> = r
                 .ports
                 .iter()
                 .map(|p| {
                     json!({
                         "port":        p.port,
-                        "status":      match p.status {
-                            PortStatus::Open         => "open",
-                            PortStatus::Closed       => "closed",
-                            PortStatus::Filtered     => "filtered",
-                            PortStatus::OpenFiltered => "open|filtered",
-                        },
+                        "protocol":    if p.protocol == crate::service::Transport::Udp { "udp" } else { "tcp" },
+                        "status":      p.status.as_str(),
                         "tls":         p.tls,
                         "tls_cert":    p.tls_cert,
+                        "legacy_tls":  p.legacy_tls,
                         "banner":      p.banner,
                         "service": {
                             "name":        p.service.name,
@@ -184,13 +229,16 @@ pub fn print_json_multi(spec: &str, results: &[ScanResult], total_elapsed: Durat
                 "total_ports": r.total_ports,
                 "open_count":  r.open_count(),
                 "elapsed_ms":  r.elapsed.as_millis(),
+                "closed_count":   r.closed,
+                "filtered_count": r.filtered,
+                "error_count":    r.errors,
                 "open_ports":  open_ports,
-                "all_ports":   all_ports,
+                "ports":       ports,
             })
         })
         .collect();
 
-    let doc = if results.len() == 1 {
+    let doc = if !multi && results.len() == 1 {
         json!({
             "rustscan_rs": {
                 "target":       spec,
@@ -199,8 +247,11 @@ pub fn print_json_multi(spec: &str, results: &[ScanResult], total_elapsed: Durat
                 "total_ports":  results[0].total_ports,
                 "open_count":   results[0].open_count(),
                 "elapsed_ms":   results[0].elapsed.as_millis(),
-                "open_ports":   results[0].open_ports().map(|p| p.port).collect::<Vec<u16>>(),
-                "all_ports":    host_docs[0]["all_ports"].clone(),
+                "closed_count":   results[0].closed,
+                "filtered_count": results[0].filtered,
+                "error_count":    results[0].errors,
+                "open_ports":   host_docs[0]["open_ports"].clone(),
+                "ports":        host_docs[0]["ports"].clone(),
             }
         })
     } else {
@@ -222,13 +273,18 @@ pub fn print_json_multi(spec: &str, results: &[ScanResult], total_elapsed: Durat
 
 // ─── CSV Output ───────────────────────────────────────────────────────────────
 
-pub fn print_csv_multi(results: &[ScanResult]) {
-    // Print standard CSV header
-    println!("Host,Hostname,Port,Status,TLS,Service,Banner");
+/// CSV to stdout. Only open / open|filtered ports are listed. The `csv` crate
+/// handles quoting; `csv_safe` neutralises spreadsheet formulas in
+/// attacker-controlled fields (banner, PTR hostname).
+pub fn print_csv_multi(results: &[ScanResult]) -> Result<()> {
+    use crate::export::csv_safe;
+
+    let mut wtr = csv::Writer::from_writer(std::io::stdout());
+    wtr.write_record([
+        "Host", "Hostname", "Port", "Status", "TLS", "Service", "Banner",
+    ])?;
 
     for r in results {
-        // In CSV mode, it's typically best to only export open ports
-        // to prevent generating massive files for full range scans.
         for p in r.open_ports() {
             let status = match p.status {
                 PortStatus::Open => "open",
@@ -236,136 +292,22 @@ pub fn print_csv_multi(results: &[ScanResult]) {
                 PortStatus::Filtered => "filtered",
                 PortStatus::OpenFiltered => "open|filtered",
             };
-
-            let tls_str = if p.tls { "true" } else { "false" };
-
-            // Escape quotes inside banners
-            let banner = p.banner.as_deref().unwrap_or("");
-            let banner_escaped = banner.replace('"', "\"\"");
-
             let proto_str = match p.protocol {
                 crate::service::Transport::Tcp => "tcp",
                 crate::service::Transport::Udp => "udp",
                 crate::service::Transport::TcpUdp => "tcp/udp",
             };
-
-            let hostname_str = r.hostname.as_deref().unwrap_or("");
-
-            println!(
-                "{},{},{}/{},{},{},{},\"{}\"",
-                r.target,
-                hostname_str,
-                p.port,
-                proto_str,
+            wtr.write_record([
+                r.target.as_str(),
+                &csv_safe(r.hostname.as_deref().unwrap_or("")),
+                &format!("{}/{}", p.port, proto_str),
                 status,
-                tls_str,
+                if p.tls { "true" } else { "false" },
                 p.service.name,
-                banner_escaped
-            );
+                &csv_safe(p.banner.as_deref().unwrap_or("")),
+            ])?;
         }
     }
-}
-
-// ─── HTML Output ──────────────────────────────────────────────────────────────
-
-pub fn print_html_multi(spec: &str, results: &[ScanResult], elapsed: Duration) {
-    println!("<!DOCTYPE html>");
-    println!("<html lang=\"en\">");
-    println!("<head>");
-    println!("  <meta charset=\"UTF-8\">");
-    println!("  <title>Scan Report: {}</title>", spec);
-    println!("  <style>");
-    println!("    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; color: #333; background: #f9f9f9; }}");
-    println!("    h1, h2 {{ color: #111; }}");
-    println!("    .summary {{ background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 30px; }}");
-    println!("    .host-block {{ background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 30px; }}");
-    println!("    table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}");
-    println!("    th, td {{ text-align: left; padding: 12px; border-bottom: 1px solid #eee; }}");
-    println!("    th {{ background: #fdfdfd; font-weight: 600; color: #555; }}");
-    println!("    .badge-open {{ background: #e6f4ea; color: #1e8e3e; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; }}");
-    println!("    .badge-tls {{ background: #fce8e6; color: #d93025; padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; margin-left: 5px; }}");
-    println!("    code {{ background: #f4f4f4; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }}");
-    println!("  </style>");
-    println!("</head>");
-    println!("<body>");
-
-    // Summary block
-    let total_hosts = results.len();
-    let total_open: usize = results.iter().map(|r| r.open_count()).sum();
-
-    println!("  <h1>Rustscan-rs Report</h1>");
-    println!("  <div class=\"summary\">");
-    println!("    <p><strong>Target:</strong> {}</p>", spec);
-    println!("    <p><strong>Hosts Scanned:</strong> {}</p>", total_hosts);
-    println!(
-        "    <p><strong>Total Open Ports:</strong> {}</p>",
-        total_open
-    );
-    println!(
-        "    <p><strong>Total Elapsed Time:</strong> {:.2}s</p>",
-        elapsed.as_secs_f64()
-    );
-    println!("  </div>");
-
-    // Per-host blocks
-    for result in results {
-        println!("  <div class=\"host-block\">");
-        if let Some(h) = &result.hostname {
-            println!("    <h2>Host: {} ({})</h2>", h, result.target);
-        } else {
-            println!("    <h2>Host: {}</h2>", result.target);
-        }
-
-        if result.open_count() == 0 {
-            println!("    <p>No open ports found.</p>");
-        } else {
-            println!("    <table>");
-            println!("      <thead>");
-            println!("        <tr>");
-            println!("          <th>Port</th>");
-            println!("          <th>Service</th>");
-            println!("          <th>Description / Banner</th>");
-            println!("        </tr>");
-            println!("      </thead>");
-            println!("      <tbody>");
-
-            for p in result.open_ports() {
-                println!("        <tr>");
-                let proto_str = match p.protocol {
-                    crate::service::Transport::Tcp => "tcp",
-                    crate::service::Transport::Udp => "udp",
-                    crate::service::Transport::TcpUdp => "tcp/udp",
-                };
-                print!(
-                    "          <td><span class=\"badge-open\">{}/{}</span>",
-                    p.port, proto_str
-                );
-                if p.tls {
-                    print!("<span class=\"badge-tls\">TLS</span>");
-                }
-                println!("</td>");
-
-                println!("          <td>{}</td>", p.service.name);
-
-                print!("          <td>");
-                if let Some(ref banner) = p.banner {
-                    // Primitive escaping for HTML
-                    let safe_banner = banner.replace('<', "&lt;").replace('>', "&gt;");
-                    print!("<code>{}</code>", safe_banner);
-                } else {
-                    print!("{}", p.service.description);
-                }
-                println!("</td>");
-                println!("        </tr>");
-            }
-
-            println!("      </tbody>");
-            println!("    </table>");
-        }
-
-        println!("  </div>");
-    }
-
-    println!("</body>");
-    println!("</html>");
+    wtr.flush()?;
+    Ok(())
 }

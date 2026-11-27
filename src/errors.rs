@@ -3,7 +3,6 @@
 /// Uses `thiserror` to derive `std::error::Error` implementations cleanly.
 /// All domain-specific errors are variants of `RustScanError`.
 /// Callers that need ad-hoc context use `anyhow::Context` on top.
-
 use thiserror::Error;
 
 /// Top-level error type for rustscan-rs.
@@ -23,9 +22,7 @@ pub enum RustScanError {
     InvalidTimeout { ms: u64 },
 
     /// Emitted when concurrency is zero or absurdly large.
-    #[error(
-        "concurrency value {value} is invalid — must be between 1 and {max}"
-    )]
+    #[error("concurrency value {value} is invalid — must be between 1 and {max}")]
     InvalidConcurrency { value: usize, max: usize },
 
     // ── I/O ───────────────────────────────────────────────────────────────
@@ -60,6 +57,19 @@ pub enum RustScanError {
          limit of {max} — use a longer prefix (e.g., /16 or higher)"
     )]
     CidrTooLarge { input: String, count: u64, max: u64 },
+
+    /// A `-p` / `--exclude-ports` spec could not be parsed.
+    #[error("invalid port spec '{spec}': {reason}")]
+    InvalidPortSpec { spec: String, reason: String },
+
+    /// The OS ran out of sockets, buffers or ephemeral ports. The scanner
+    /// retries these with less concurrency.
+    #[error("OS resource exhausted: {0}")]
+    ResourceExhausted(String),
+
+    /// Any other invalid CLI option combination or value.
+    #[error("invalid option: {0}")]
+    InvalidOption(String),
 }
 
 /// Convenience `Result` alias that defaults the error type to [`RustScanError`].

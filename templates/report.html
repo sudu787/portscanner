@@ -160,6 +160,7 @@
 
         .badge.open { background: rgba(16, 185, 129, 0.1); color: var(--success); }
         .badge.tls { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
+        .badge.warn { background: rgba(245, 158, 11, 0.12); color: var(--warning); margin-right: 0.25rem; }
 
         .banner-text {
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -217,35 +218,36 @@
                     <tr>
                         <td>
                             <strong>{{ record.host }}</strong>
-                            {% match record.hostname %}
-                                {% when Some with (h) %}
+                            {% if let Some(h) = record.hostname %}
                                 <div style="font-size: 0.875rem; color: var(--text-muted)">{{ h }}</div>
-                                {% when None %}
-                            {% endmatch %}
+                            {% endif %}
                         </td>
                         <td>{{ record.port }}</td>
                         <td>{{ record.service }}</td>
                         <td><span class="badge open">{{ record.status }}</span></td>
                         <td>
-                            {% if record.tls_subject.is_some() %}
+                            {% if let Some(v) = record.legacy_tls %}
+                                <span class="badge warn">⚠ accepts {{ v }}</span>
+                            {% endif %}
+                            {% if record.cert_expired == Some(true) %}<span class="badge warn">⚠ cert expired</span>{% endif %}
+                            {% if record.cert_self_signed == Some(true) %}<span class="badge warn">⚠ self-signed</span>{% endif %}
+                            {% if record.tls %}
                                 <span class="badge tls">🔒 TLS</span>
+                            {% endif %}
+                            {% if record.tls_subject.is_some() %}
                                 <div class="banner-text">
-                                    {% match record.tls_subject %}
-                                        {% when Some with (sub) %} Subj: {{ sub }}
-                                        {% when None %}
-                                    {% endmatch %}<br>
-                                    {% match record.tls_issuer %}
-                                        {% when Some with (iss) %} Iss: {{ iss }}
-                                        {% when None %}
-                                    {% endmatch %}
+                                    {% if let Some(sub) = record.tls_subject %}
+                                         Subj: {{ sub }}
+                                    {% endif %}<br>
+                                    {% if let Some(iss) = record.tls_issuer %}
+                                         Iss: {{ iss }}
+                                    {% endif %}
                                 </div>
                             {% endif %}
                             
-                            {% match record.banner %}
-                                {% when Some with (b) %}
+                            {% if let Some(b) = record.banner %}
                                 <div class="banner-text">{{ b }}</div>
-                                {% when None %}
-                            {% endmatch %}
+                            {% endif %}
                         </td>
                     </tr>
                     {% endfor %}

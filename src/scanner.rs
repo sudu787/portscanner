@@ -1,553 +1,704 @@
-/// scanner.rs — Production-grade async TCP scanning engine for rustscan-rs
-///
-/// ═══════════════════════════════════════════════════════════════════════════
-/// WHY A SEMAPHORE?  (read this before diving into the code)
-/// ═══════════════════════════════════════════════════════════════════════════
-///
-/// The Phase-2 implementation used a manual "sliding-window" over a
-/// `FuturesUnordered` pool.  It worked, but had two subtle problems:
-///
-///   1. TYPE ERASURE TAX  — two structurally identical `async` blocks in the
-///      same function are still different anonymous types.  We were forced to
-///      use `Pin<Box<dyn Future<…>>>` to unify them, adding a heap allocation
-///      and a virtual dispatch per probe.
-///
-///   2. SINGLE-TASK SCHEDULING — all futures ran inside ONE Tokio task.
-///      The work-stealing thread-pool was underused because we never yielded
-///      to the scheduler between individual probes.
-///
-/// The Semaphore model solves both:
-///
-///   ┌─ spawning loop ─────────────────────────────────────────────────────┐
-///   │  for port in range {                                                 │
-///   │      let permit = semaphore.acquire_owned().await;  // ← BACK-PRESS │
-///   │      tokio::spawn(async move {                                       │
-///   │          scan_port(…).await;                                         │
-///   │          drop(permit);   // ← releases one FD slot                  │
-///   │      });                                                             │
-///   │  }                                                                   │
-///   └──────────────────────────────────────────────────────────────────────┘
-///
-///   • `tokio::spawn` gives each probe its own Tokio task → work-stealing.
-///   • `JoinHandle<T>` is a concrete type → no `Box::pin` needed anywhere.
-///   • `acquire_owned().await` suspends the LOOP (not a thread) when all
-///     permits are taken.  Tokio's scheduler runs probe tasks in the gap.
-///   • Each permit = one open file descriptor.  Dropping the permit is the
-///     FD budget's "commit" — not the TCP send, not the result push.
-///
-/// ═══════════════════════════════════════════════════════════════════════════
-/// TOKIO SCHEDULING DEEP-DIVE
-/// ═══════════════════════════════════════════════════════════════════════════
-///
-///   tokio::spawn  →  task pushed onto the global injector queue
-///                    ↓
-///                 work-stealing thread picks it up
-///                    ↓
-///                 TcpStream::connect is EPOLL/IOCP-backed (non-blocking)
-///                    ↓
-///                 thread de-schedules the task and registers interest
-///                 with the I/O reactor (no thread blocked)
-///                    ↓
-///                 OS signals readiness → reactor wakes the task
-///                    ↓
-///                 task completes, permit dropped, slot freed
-///
-///   This means N concurrent probes use only a handful of OS threads
-///   (typically num_cpus) regardless of `--concurrency`.
-///
-/// ═══════════════════════════════════════════════════════════════════════════
-/// PERFORMANCE IMPLICATIONS
-/// ═══════════════════════════════════════════════════════════════════════════
-///
-///   Memory budget (65 535-port scan, --concurrency 1000):
-///     • At most 1 000 TcpStream objects alive = ~8 KB of socket buffers each
-///       → ≈8 MB OS socket memory.  Well within normal system limits.
-///     • JoinHandles accumulate up to 65 535 entries ≈ 65 535 × 32 B = ~2 MB.
-///       Each handle is just a waker, not the full task state.
-///     • Result Vec<PortResult> ≈ 65 535 × 9 B = ~590 KB.
-///
-///   FD budget:
-///     • Semaphore permits = open sockets.  Set --concurrency ≤ `ulimit -n`.
-///     • On Linux the default is 1 024 FDs per process.  Set to 65 535 with
-///       `ulimit -n 65535` before running for maximum throughput.
-///     • Windows has a higher default (~16 000 concurrent sockets).
+//! scanner.rs — Async TCP/UDP scanning engine for rustscan-rs
+//!
+//! ## Concurrency model
+//!
+//! One `Semaphore` with `concurrency` permits governs *all* probes across
+//! *all* hosts (permits = sockets in flight = file descriptors). The spawning
+//! loop walks ports × hosts lazily — port-major, so load is spread across
+//! hosts instead of hammering one at a time — in a shuffled order unless
+//! `--sequential` is given. Nothing proportional to `hosts × ports` is ever
+//! materialised: each task records its outcome straight into its host's
+//! accumulator, and only open / open|filtered ports are kept; closed and
+//! filtered ones are just counted. Memory is O(hosts + open ports).
+//!
+//! `--rate` adds a token interval in front of every spawn; `--retries`
+//! re-sends probes that timed out, which is where false negatives come from.
+
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::sync::{Notify, Semaphore};
+use tokio::time::{timeout, MissedTickBehavior};
 use tracing::{debug, trace, warn};
 
 use crate::errors::RustScanError;
-use crate::probes::{detect_tls, grab_banner};
-use crate::service::{detect_service, ServiceInfo, Transport};
+use crate::probes::{detect_legacy_tls, detect_tls, grab_banner, udp_payload};
+use crate::service::{detect_service, identify_banner, ServiceInfo, Transport};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
-/// The state of a port as determined by a TCP connect probe.
+/// The state of a port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortStatus {
-    /// Three-way handshake succeeded — the port is open and accepting connections.
+    /// Handshake succeeded (TCP) or the service answered (UDP).
     Open,
-    /// The OS returned an immediate RST — the port is actively closed.
+    /// RST (TCP) or ICMP port-unreachable (UDP).
     Closed,
-    /// The connection attempt timed out — firewalled or silently dropping.
-    /// nmap terminology: "filtered".
+    /// No answer / host or network unreachable.
     Filtered,
-    /// A UDP probe timed out. It might be open, or it might be silently firewalled.
+    /// UDP probe got no answer: open and silent, or firewalled.
     OpenFiltered,
+}
+
+impl PortStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortStatus::Open => "open",
+            PortStatus::Closed => "closed",
+            PortStatus::Filtered => "filtered",
+            PortStatus::OpenFiltered => "open|filtered",
+        }
+    }
 }
 
 /// The result of probing a single port.
 #[derive(Debug, Clone)]
 pub struct PortResult {
-    /// The probed port number.
     pub port: u16,
-    /// The transport layer protocol (TCP or UDP) that was probed.
-    pub protocol: crate::service::Transport,
-    /// What the probe observed.
+    pub protocol: Transport,
     pub status: PortStatus,
-    /// Best-guess service identification based on the port number.
-    ///
-    /// This is a static, port-based hint — not confirmed via banner grabbing.
-    /// Phase 5 will extend this with actual service fingerprinting.
+    /// Service: identified from the banner when possible, else the port-based guess.
     pub service: ServiceInfo,
-    /// The grabbed service banner, if any.
+    /// Sanitized banner (first line; plus `Server:` for HTTP).
     pub banner: Option<String>,
-    /// Was a TLS handshake successful?
+    /// Does the port speak TLS (modern or legacy)?
     pub tls: bool,
-    /// Extracted TLS certificate metadata (if TLS handshake succeeded).
+    /// Certificate details from a TLS 1.2/1.3 handshake.
     pub tls_cert: Option<crate::tls::TlsCertInfo>,
+    /// `Some("TLSv1.0")` etc. when the server still accepts a deprecated protocol.
+    pub legacy_tls: Option<&'static str>,
 }
 
-/// Aggregated results returned by [`scan_host`].
+/// Aggregated results for one host.
 #[derive(Debug)]
 pub struct ScanResult {
-    /// Human-readable target (IP or hostname as given).
+    /// The scanned IP address.
     pub target: String,
-    /// The resolved hostname of the target, if requested and successful.
+    /// PTR name (with `--resolve-dns`) or the hostname the user gave.
     pub hostname: Option<String>,
-    /// Total number of ports in the requested range.
+    /// Number of probes requested for this host (ports × protocols).
     pub total_ports: u32,
-    /// Wall-clock time for the full scan.
+    /// Wall-clock time of the whole scan.
     pub elapsed: Duration,
-    /// Every port result, sorted ascending by port number.
+    /// Open and open|filtered ports, sorted by (port, protocol).
     pub ports: Vec<PortResult>,
+    pub closed: u32,
+    pub filtered: u32,
+    /// Probes that failed with an OS error (or never completed).
+    pub errors: u32,
 }
 
 impl ScanResult {
-    /// Iterator over only the open ports.
+    /// Ports worth reporting: open and open|filtered.
     pub fn open_ports(&self) -> impl Iterator<Item = &PortResult> {
         self.ports
             .iter()
             .filter(|r| r.status == PortStatus::Open || r.status == PortStatus::OpenFiltered)
     }
 
-    /// Count of open ports discovered.
+    /// Confirmed open ports only (excludes ambiguous open|filtered).
     pub fn open_count(&self) -> usize {
-        self.open_ports().count()
+        self.ports
+            .iter()
+            .filter(|r| r.status == PortStatus::Open)
+            .count()
     }
 }
 
-// ─── Scanner configuration ────────────────────────────────────────────────────
+/// One host to scan. `name` is the hostname the user typed, if any (used as
+/// TLS SNI and as the display name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub addr: IpAddr,
+    pub name: Option<String>,
+}
 
-/// All parameters needed to run a host scan.
-///
-/// Wrapped in `Arc` so it can be passed cheaply to `scan_host` without
-/// copying the contents.
+impl Target {
+    pub fn ip(addr: IpAddr) -> Self {
+        Self { addr, name: None }
+    }
+}
+
+/// All parameters of a scan (shared by every host).
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
-    /// The target IP address.
-    pub addr: IpAddr,
-    /// First port to probe (inclusive).
-    pub start_port: u16,
-    /// Last port to probe (inclusive).
-    pub end_port: u16,
-    /// Per-connection timeout.
+    pub ports: Vec<u16>,
     pub timeout: Duration,
-    /// Maximum number of concurrent TCP connections in flight at any moment.
-    ///
-    /// This is the semaphore permit count.  Choosing a value higher than the
-    /// OS file-descriptor limit will cause connection errors — the semaphore
-    /// prevents that.
+    /// Probes in flight at once, across all hosts.
     pub concurrency: usize,
-    /// Whether to attempt service banner grabbing on open ports.
+    /// Extra attempts for probes that timed out.
+    pub retries: u8,
+    /// Max new probes per second.
+    pub rate: Option<u32>,
+    /// Shuffle port and host order.
+    pub randomize: bool,
     pub banner: bool,
-    /// Whether to probe open ports for TLS support.
     pub tls: bool,
-    /// Automatically resolve target IPs to hostnames via reverse DNS.
-    pub resolve_dns: bool,
-    /// Scan TCP ports.
     pub tcp: bool,
-    /// Scan UDP ports.
     pub udp: bool,
+    pub resolve_dns: bool,
+    /// Print `Open ip:port` to stderr the moment a port is found.
+    pub live: bool,
+}
+
+/// Per-probe options (cheap to clone into each task).
+#[derive(Debug, Clone)]
+pub struct ProbeOpts {
+    pub timeout: Duration,
+    pub retries: u8,
+    pub banner: bool,
+    pub tls: bool,
+    pub sni: Option<Arc<str>>,
 }
 
 // ─── scan_port() ──────────────────────────────────────────────────────────────
 
-/// Attempt a single TCP connect to `addr:port` within `timeout_dur`.
-///
-/// # Design note
-///
-/// This is a free async function so it can be moved into `tokio::spawn`
-/// without lifetime issues.  All parameters are `Copy`/`Clone`.
-///
-/// # Returns
-///
-/// Always returns `Ok(PortResult)` for network-level outcomes (connection
-/// refused, timeout, unreachable).  Only hard OS errors that are neither
-/// "refused" nor "timeout" bubble up as `Err`.
+/// Probe one port. Network outcomes (refused, timeout, unreachable) are
+/// `Ok`; only unexpected OS errors (EMFILE, ENOBUFS, …) are `Err`.
 pub async fn scan_port(
     addr: IpAddr,
     port: u16,
     protocol: Transport,
-    timeout_dur: Duration,
-    do_banner: bool,
-    do_tls: bool,
+    opts: &ProbeOpts,
 ) -> Result<PortResult, RustScanError> {
-    let socket_addr = SocketAddr::new(addr, port);
+    let sa = SocketAddr::new(addr, port);
+    trace!(%sa, ?protocol, "probing");
 
-    trace!(
-        target = %addr,
-        port,
-        ?protocol,
-        timeout_ms = timeout_dur.as_millis(),
-        "probing"
-    );
-
-    let (status, banner, is_tls, tls_cert) = match protocol {
-        Transport::Tcp => probe_tcp(socket_addr, timeout_dur, do_banner, do_tls).await?,
-        Transport::Udp => probe_udp(socket_addr, timeout_dur).await?,
-        Transport::TcpUdp => unreachable!("Scan iteration uses explicit Tcp or Udp"),
-    };
-
-    Ok(PortResult {
+    let mut result = PortResult {
         port,
         protocol,
-        status,
+        status: PortStatus::Filtered,
         service: detect_service(port, protocol),
-        banner,
-        tls: is_tls,
-        tls_cert,
-    })
-}
+        banner: None,
+        tls: false,
+        tls_cert: None,
+        legacy_tls: None,
+    };
 
-async fn probe_tcp(
-    socket_addr: SocketAddr,
-    timeout_dur: Duration,
-    do_banner: bool,
-    do_tls: bool,
-) -> Result<
-    (
-        PortStatus,
-        Option<String>,
-        bool,
-        Option<crate::tls::TlsCertInfo>,
-    ),
-    RustScanError,
-> {
-    let port = socket_addr.port();
-    match timeout(timeout_dur, TcpStream::connect(socket_addr)).await {
-        Err(_) => {
-            trace!(port, "filtered (timeout)");
-            Ok((PortStatus::Filtered, None, false, None))
-        }
-        Ok(Ok(mut stream)) => {
-            debug!(port, "open");
-            let mut banner_str = None;
-            if do_banner {
-                banner_str = grab_banner(&mut stream).await;
+    match protocol {
+        Transport::Udp => result.status = probe_udp(sa, opts).await?,
+        _ => {
+            let Some(mut stream) = connect_tcp(sa, opts, &mut result.status).await? else {
+                return Ok(result);
+            };
+            result.status = PortStatus::Open;
+            if opts.banner {
+                result.banner =
+                    grab_banner(&mut stream, opts.timeout.min(Duration::from_secs(2))).await;
             }
             drop(stream);
-            let mut tls_cert = None;
-            let mut is_tls_flag = false;
-            if do_tls {
-                tls_cert = detect_tls(socket_addr.ip(), port, timeout_dur).await;
-                is_tls_flag = tls_cert.is_some();
+            if opts.tls {
+                result.tls_cert = detect_tls(addr, port, opts.timeout, opts.sni.as_deref()).await;
+                result.legacy_tls = detect_legacy_tls(addr, port, opts.timeout).await;
+                result.tls = result.tls_cert.is_some() || result.legacy_tls.is_some();
             }
-            Ok((PortStatus::Open, banner_str, is_tls_flag, tls_cert))
-        }
-        Ok(Err(io_err)) => {
-            use std::io::ErrorKind;
-            match io_err.kind() {
-                ErrorKind::ConnectionRefused => {
-                    trace!(port, "closed (RST)");
-                    Ok((PortStatus::Closed, None, false, None))
-                }
-                ErrorKind::TimedOut
-                | ErrorKind::HostUnreachable
-                | ErrorKind::NetworkUnreachable => {
-                    trace!(port, "filtered (unreachable)");
-                    Ok((PortStatus::Filtered, None, false, None))
-                }
-                ErrorKind::PermissionDenied => {
-                    warn!(port, "permission denied — skipping");
-                    Ok((PortStatus::Filtered, None, false, None))
-                }
-                _ => Err(RustScanError::Io(io::Error::new(
-                    io_err.kind(),
-                    format!("tcp port {port}: {io_err}"),
-                ))),
+            if let Some(svc) = result
+                .banner
+                .as_deref()
+                .and_then(|b| identify_banner(b, result.tls))
+            {
+                result.service = svc;
+            } else if result.tls
+                && (!result.service.is_known() || result.service.name == "EPHEMERAL")
+            {
+                result.service = crate::service::TLS_SERVICE;
             }
         }
     }
+    Ok(result)
 }
 
-async fn probe_udp(
-    socket_addr: SocketAddr,
-    timeout_dur: Duration,
-) -> Result<
-    (
-        PortStatus,
-        Option<String>,
-        bool,
-        Option<crate::tls::TlsCertInfo>,
-    ),
-    RustScanError,
-> {
-    let port = socket_addr.port();
+/// TCP connect with retries on timeout. `Ok(None)` = not open (status set).
+async fn connect_tcp(
+    sa: SocketAddr,
+    opts: &ProbeOpts,
+    status: &mut PortStatus,
+) -> Result<Option<TcpStream>, RustScanError> {
+    use io::ErrorKind::*;
+    for attempt in 0..=opts.retries {
+        match timeout(opts.timeout, TcpStream::connect(sa)).await {
+            Err(_) => trace!(%sa, attempt, "timeout"),
+            Ok(Ok(stream)) => {
+                // TCP self-connect: on loopback, when the destination port
+                // equals our own ephemeral source port, the kernel connects
+                // the socket to itself. Nothing is listening — not open.
+                if is_self_connect(stream.local_addr().ok(), sa) {
+                    *status = PortStatus::Closed;
+                    return Ok(None);
+                }
+                return Ok(Some(stream));
+            }
+            Ok(Err(e)) => match e.kind() {
+                ConnectionRefused => {
+                    *status = PortStatus::Closed;
+                    return Ok(None);
+                }
+                // A timeout reported by the OS is retryable like ours.
+                TimedOut => trace!(%sa, attempt, "os timeout"),
+                HostUnreachable | NetworkUnreachable | PermissionDenied => {
+                    *status = PortStatus::Filtered;
+                    return Ok(None);
+                }
+                // Resource exhaustion is handled by adaptive concurrency in
+                // `scan_targets`; anything else is a genuine probe error.
+                _ => return Err(os_error(format!("tcp {sa}"), e)),
+            },
+        }
+    }
+    *status = PortStatus::Filtered;
+    Ok(None)
+}
 
-    // Bind an ephemeral UDP port
-    let bind_addr = if socket_addr.is_ipv4() {
-        "0.0.0.0:0"
+/// Classify an unexpected socket error. Running out of file descriptors,
+/// buffers or ephemeral ports is retryable with less concurrency.
+fn os_error(ctx: String, e: io::Error) -> RustScanError {
+    use io::ErrorKind::*;
+    // EMFILE/ENFILE (24/23), ENOBUFS (Linux 105, macOS 55),
+    // WSAEMFILE (10024), WSAENOBUFS (10055).
+    let resource = matches!(e.kind(), AddrInUse | AddrNotAvailable | OutOfMemory)
+        || matches!(e.raw_os_error(), Some(23 | 24 | 55 | 105 | 10024 | 10055));
+    if resource {
+        RustScanError::ResourceExhausted(format!("{ctx}: {e}"))
     } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind_addr)
-        .await
-        .map_err(|e| RustScanError::Io(io::Error::new(e.kind(), format!("udp bind: {e}"))))?;
+        RustScanError::Io(io::Error::new(e.kind(), format!("{ctx}: {e}")))
+    }
+}
 
-    // Connect to the target port so errors bubble up on recv
-    if let Err(e) = socket.connect(socket_addr).await {
-        return Err(RustScanError::Io(io::Error::new(
-            e.kind(),
-            format!("udp connect port {port}: {e}"),
-        )));
+async fn probe_udp(sa: SocketAddr, opts: &ProbeOpts) -> Result<PortStatus, RustScanError> {
+    use io::ErrorKind::*;
+    let io_err = |what: &str, e: io::Error| os_error(format!("udp {what} {sa}"), e);
+    let bind = if sa.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let socket = UdpSocket::bind(bind).await.map_err(|e| io_err("bind", e))?;
+    socket.connect(sa).await.map_err(|e| io_err("connect", e))?;
+    if is_self_connect(socket.local_addr().ok(), sa) {
+        // We would just read back our own datagram.
+        return Ok(PortStatus::Closed);
     }
 
-    // Send a generic empty/null payload to provoke a response
-    if let Err(e) = socket.send(b"\x00").await {
-        return Err(RustScanError::Io(io::Error::new(
-            e.kind(),
-            format!("udp send port {port}: {e}"),
-        )));
-    }
-
-    let mut buf = [0; 1024];
-    match timeout(timeout_dur, socket.recv(&mut buf)).await {
-        Err(_) => {
-            trace!(port, "open|filtered (timeout)");
-            Ok((PortStatus::OpenFiltered, None, false, None))
-        }
-        Ok(Ok(_n)) => {
-            debug!(port, "open (received data)");
-            Ok((PortStatus::Open, None, false, None)) // Could grab UDP banners here later
-        }
-        Ok(Err(io_err)) => {
-            use std::io::ErrorKind;
-            if io_err.kind() == ErrorKind::ConnectionReset {
-                trace!(port, "closed (ICMP Port Unreachable)");
-                Ok((PortStatus::Closed, None, false, None))
-            } else if io_err.kind() == ErrorKind::PermissionDenied {
-                warn!(port, "permission denied — skipping");
-                Ok((PortStatus::Closed, None, false, None))
-            } else {
-                trace!(port, "open|filtered (other error: {:?})", io_err.kind());
-                Ok((PortStatus::OpenFiltered, None, false, None))
+    let payload = udp_payload(sa.port());
+    let mut buf = [0u8; 1500];
+    for _ in 0..=opts.retries {
+        if let Err(e) = socket.send(payload).await {
+            // ICMP from a previous attempt can surface on send, too.
+            if matches!(e.kind(), ConnectionRefused | ConnectionReset) {
+                return Ok(PortStatus::Closed);
             }
+            return Err(io_err("send", e));
+        }
+        match timeout(opts.timeout, socket.recv(&mut buf)).await {
+            Err(_) => continue, // silence: retry
+            Ok(Ok(_)) => return Ok(PortStatus::Open),
+            // ICMP port-unreachable: ECONNREFUSED on Linux/macOS, WSAECONNRESET on Windows.
+            Ok(Err(e)) if matches!(e.kind(), ConnectionRefused | ConnectionReset) => {
+                return Ok(PortStatus::Closed)
+            }
+            Ok(Err(e)) if e.kind() == PermissionDenied => return Ok(PortStatus::Filtered),
+            Ok(Err(e)) => {
+                trace!(%sa, error = %e, "udp recv error");
+                return Ok(PortStatus::OpenFiltered);
+            }
+        }
+    }
+    Ok(PortStatus::OpenFiltered)
+}
+
+// ─── scan_targets() ───────────────────────────────────────────────────────────
+
+/// Adaptive concurrency never shrinks below this many sockets.
+const MIN_CONCURRENCY: usize = 32;
+/// Re-attempts of a probe that hit OS resource exhaustion.
+const RESOURCE_RETRIES: u32 = 8;
+
+/// Retire one concurrency slot unless already at the floor. (A plain CAS
+/// loop: `fetch_update` is deprecated on new Rust, `try_update` is too new
+/// for the MSRV.)
+fn try_shrink(capacity: &AtomicUsize) -> bool {
+    let mut c = capacity.load(SeqCst);
+    while c > MIN_CONCURRENCY {
+        match capacity.compare_exchange_weak(c, c - 1, SeqCst, SeqCst) {
+            Ok(_) => return true,
+            Err(now) => c = now,
+        }
+    }
+    false
+}
+
+/// Completion tracking without keeping a handle per task (memory stays flat).
+struct Pending {
+    count: AtomicUsize,
+    done: Notify,
+}
+
+/// Decrements `Pending` when a task ends, including by panic.
+struct TaskGuard(Arc<Pending>);
+
+impl TaskGuard {
+    fn new(p: &Arc<Pending>) -> Self {
+        p.count.fetch_add(1, SeqCst);
+        Self(Arc::clone(p))
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, SeqCst) == 1 {
+            // `notify_one` stores a permit, so a wakeup can't be lost.
+            self.0.done.notify_one();
         }
     }
 }
 
-// ─── scan_host() ──────────────────────────────────────────────────────────────
+#[derive(Default)]
+struct HostAcc {
+    ports: Vec<PortResult>,
+    closed: u32,
+    filtered: u32,
+    errors: u32,
+    first_error: Option<String>,
+}
 
-/// Scan all ports in `config.start_port..=config.end_port` on the target host.
-///
-/// # Concurrency model
-///
-/// ```text
-///  spawning loop                 Tokio work-stealing pool
-///  ─────────────                 ────────────────────────
-///  acquire permit ──────────┐
-///  tokio::spawn(task) ──────┼──► [task 1: connect port 80]
-///  acquire permit ──────────┤
-///  tokio::spawn(task) ──────┼──► [task 2: connect port 443]
-///       ⋮                   │         ⋮
-///  SUSPEND (all permits      │   [task 1000: connect port X]
-///   taken by running tasks)  │
-///                            │   task 42 finishes → drops permit
-///  WAKE (permit freed) ──────┘
-///  tokio::spawn(task) ──────────► [task 1001: connect next port]
-///       ⋮
-/// ```
-///
-/// The spawning loop holds at most `concurrency` tasks in flight at any
-/// moment.  `FuturesUnordered` polls the `JoinHandle`s in completion order
-/// so results are collected as soon as each task finishes.
-///
-/// # Why JoinHandle eliminates the Box::pin problem
-///
-/// In Phase 2 we needed `Pin<Box<dyn Future<…>>>` because two textually
-/// identical `async` blocks have different anonymous types and
-/// `FuturesUnordered<Fut>` requires all futures to be the same type.
-///
-/// `tokio::spawn` returns `JoinHandle<T>` — a concrete, sized type.  Every
-/// spawned task produces the same `JoinHandle<Result<PortResult, …>>` type
-/// regardless of what the inner `async` block looks like.  No boxing needed.
-///
-/// # Errors
-///
-/// Returns `Err` only on hard OS-level failures or unexpected task panics.
-pub async fn scan_host(config: Arc<ScanConfig>) -> Result<ScanResult, RustScanError> {
-    let start_time = std::time::Instant::now();
+/// Scan every port of every target, sharing one concurrency budget.
+/// Never fails as a whole: per-probe errors are counted per host.
+pub async fn scan_targets(targets: &[Target], config: &ScanConfig) -> Vec<ScanResult> {
+    let start = Instant::now();
     let mut protocols = Vec::new();
-    if config.tcp {
+    if config.tcp || !config.udp {
         protocols.push(Transport::Tcp);
     }
     if config.udp {
         protocols.push(Transport::Udp);
     }
-    if protocols.is_empty() {
-        protocols.push(Transport::Tcp); // fallback
+
+    let mut ports = config.ports.clone();
+    let mut host_order: Vec<usize> = (0..targets.len()).collect();
+    if config.randomize {
+        shuffle(&mut ports);
+        shuffle(&mut host_order);
     }
 
-    let ports_in_range = (config.end_port as u32).saturating_sub(config.start_port as u32) + 1;
-    let total_ports = ports_in_range * (protocols.len() as u32);
+    let accs: Arc<Vec<Mutex<HostAcc>>> =
+        Arc::new(targets.iter().map(|_| Mutex::default()).collect());
+    let sems = Arc::new(Semaphore::new(config.concurrency));
+    // Live pool size; shrinks when the OS runs out of sockets.
+    let capacity = Arc::new(AtomicUsize::new(config.concurrency));
+    // Outstanding tasks + 1 for the spawner itself (see the wait below).
+    let pending = Arc::new(Pending {
+        count: AtomicUsize::new(1),
+        done: Notify::new(),
+    });
+    let mut ticker = config.rate.map(|r| {
+        let mut t = tokio::time::interval(Duration::from_secs_f64(1.0 / r as f64));
+        t.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        t
+    });
+    let opts: Vec<ProbeOpts> = targets
+        .iter()
+        .map(|t| ProbeOpts {
+            timeout: config.timeout,
+            retries: config.retries,
+            banner: config.banner,
+            tls: config.tls,
+            sni: t.name.as_deref().map(Arc::from),
+        })
+        .collect();
 
-    debug!(
-        target      = %config.addr,
-        start_port  = config.start_port,
-        end_port    = config.end_port,
-        total_ports,
-        concurrency = config.concurrency,
-        timeout_ms  = config.timeout.as_millis(),
-        "host scan starting"
-    );
-
-    // ── Semaphore: the FD budget governor ────────────────────────────────
-    //
-    // `concurrency` permits = `concurrency` sockets open simultaneously.
-    // Each spawned task acquires one permit before connecting and drops it
-    // the instant `scan_port` returns (before the task exits).
-    // The spawning loop suspends on `acquire_owned().await` whenever all
-    // permits are held — backpressure at zero CPU cost.
-    let semaphore = Arc::new(Semaphore::new(config.concurrency));
-
-    // ── Handle pool ───────────────────────────────────────────────────────
-    //
-    // `JoinHandle<Result<PortResult, RustScanError>>` is concrete — all
-    // handles have the same type, so `FuturesUnordered` needs no type
-    // erasure.  The handle is cheap (~32 bytes); the full task state is
-    // heap-allocated by Tokio's runtime.
-    let mut handles: FuturesUnordered<JoinHandle<Result<PortResult, RustScanError>>> =
-        FuturesUnordered::new();
-
-    // ── Spawning loop ─────────────────────────────────────────────────────
-    //
-    // Invariant: at most `concurrency` tasks are alive concurrently.
-    // The `acquire_owned()` call suspends THIS task (not a thread) when
-    // the budget is exhausted.  Tokio's work-stealing scheduler runs probe
-    // tasks in the interim; as they complete, permits are freed and this
-    // loop resumes.
-    for port in config.start_port..=config.end_port {
-        for &protocol in &protocols {
-            // Suspends here when `concurrency` permits are already held.
-            // `acquire_owned` returns an `OwnedSemaphorePermit` that is `Send`
-            // + `'static` → safe to move into `tokio::spawn`.
-            let permit = Arc::clone(&semaphore)
-                .acquire_owned()
-                .await
-                .expect("semaphore closed unexpectedly — this is a bug");
-
-            let addr = config.addr;
-            let timeout_dur = config.timeout;
-
-            let do_banner = config.banner;
-            let do_tls = config.tls;
-
-            // `tokio::spawn` requires all captured values to be `'static + Send`.
-            // `addr` is `Copy`, `port` is `Copy`, `timeout_dur` is `Copy`,
-            // `permit` is `OwnedSemaphorePermit: Send + 'static`.  ✓
-            let handle: JoinHandle<Result<PortResult, RustScanError>> = tokio::spawn(async move {
-                let result = scan_port(addr, port, protocol, timeout_dur, do_banner, do_tls).await;
-                // Release the FD slot explicitly before the task exits.
-                // Rust would drop `permit` at end-of-scope anyway, but the
-                // explicit call makes the ordering visible in reviews.
-                drop(permit);
-                result
-            });
-
-            handles.push(handle);
-        }
-    }
-
-    // ── Result collection ─────────────────────────────────────────────────
-    //
-    // All tasks are now spawned (the loop above exited).  Some may have
-    // already completed while the spawning loop was suspended on the
-    // semaphore.  `FuturesUnordered::next()` returns each `JoinHandle`'s
-    // result in completion order — no head-of-line blocking.
-    let mut results: Vec<PortResult> = Vec::with_capacity(
-        // Conservative guess: 5 % of ports open + minimum floor.
-        (total_ports as usize / 20).max(32),
-    );
-
-    while let Some(join_result) = handles.next().await {
-        let port_result = match join_result {
-            Ok(Ok(pr)) => pr,
-
-            // scan_port returned a hard I/O error.
-            Ok(Err(e)) => return Err(e),
-
-            // The spawned task panicked.  This should never happen — if it
-            // does it is a bug in scan_port, not a network condition.
-            Err(join_err) => {
-                return Err(RustScanError::Io(io::Error::other(
-                    format!("probe task panicked: {join_err}"),
-                )));
+    for &port in &ports {
+        for &h in &host_order {
+            for &protocol in &protocols {
+                if let Some(t) = ticker.as_mut() {
+                    t.tick().await;
+                }
+                let permit = Arc::clone(&sems)
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore is never closed");
+                let addr = targets[h].addr;
+                let opts = opts[h].clone();
+                let accs = Arc::clone(&accs);
+                let live = config.live;
+                let sems = Arc::clone(&sems);
+                let capacity = Arc::clone(&capacity);
+                let guard = TaskGuard::new(&pending);
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    let mut permit = permit;
+                    let mut outcome = scan_port(addr, port, protocol, &opts).await;
+                    // Adaptive concurrency: the OS ran out of sockets/buffers,
+                    // so permanently retire this slot (down to a floor), wait
+                    // for a free one and try again.
+                    for round in 1..=RESOURCE_RETRIES {
+                        if !matches!(outcome, Err(RustScanError::ResourceExhausted(_))) {
+                            break;
+                        }
+                        if try_shrink(&capacity) {
+                            permit.forget();
+                        } else {
+                            drop(permit);
+                        }
+                        tokio::time::sleep(Duration::from_millis(25 * round as u64)).await;
+                        permit = Arc::clone(&sems)
+                            .acquire_owned()
+                            .await
+                            .expect("semaphore is never closed");
+                        outcome = scan_port(addr, port, protocol, &opts).await;
+                    }
+                    drop(permit);
+                    let mut acc = accs[h].lock().unwrap_or_else(|p| p.into_inner());
+                    match outcome {
+                        Ok(pr) => match pr.status {
+                            PortStatus::Closed => acc.closed += 1,
+                            PortStatus::Filtered => acc.filtered += 1,
+                            PortStatus::Open | PortStatus::OpenFiltered => {
+                                if live && pr.status == PortStatus::Open {
+                                    let proto = if protocol == Transport::Udp {
+                                        "/udp"
+                                    } else {
+                                        ""
+                                    };
+                                    eprintln!("Open {}{proto}", SocketAddr::new(addr, port));
+                                }
+                                acc.ports.push(pr);
+                            }
+                        },
+                        Err(e) => {
+                            acc.errors += 1;
+                            acc.first_error.get_or_insert_with(|| e.to_string());
+                        }
+                    }
+                });
             }
-        };
-
-        if port_result.status == PortStatus::Open {
-            debug!(port = port_result.port, "open port collected");
         }
-        results.push(port_result);
     }
 
-    // Sort by port number — tasks complete in network-latency order, not
-    // port order, so we always need to sort here.
-    results.sort_unstable_by_key(|r| r.port);
+    // Drop the spawner's own token; the last finished task (or we) wakes us.
+    if pending.count.fetch_sub(1, SeqCst) != 1 {
+        pending.done.notified().await;
+    }
+    let elapsed = start.elapsed();
+    let final_capacity = capacity.load(SeqCst);
+    if final_capacity < config.concurrency {
+        warn!(
+            "OS socket limit reached: concurrency adapted {} → {final_capacity}; pass -c {final_capacity} to avoid the slowdown",
+            config.concurrency
+        );
+    }
+    let total = (config.ports.len() * protocols.len()) as u32;
 
-    let elapsed = start_time.elapsed();
-
-    debug!(
-        target       = %config.addr,
-        total_probed = results.len(),
-        open_count   = results.iter().filter(|r| r.status == PortStatus::Open).count(),
-        elapsed_ms   = elapsed.as_millis(),
-        "host scan complete"
-    );
-
-    // ── Reverse DNS ───────────────────────────────────────────────────────
-    let hostname = if config.resolve_dns {
-        crate::dns::reverse_dns(config.addr).await
+    let ptrs: Vec<Option<String>> = if config.resolve_dns {
+        futures::future::join_all(targets.iter().map(|t| crate::dns::reverse_dns(t.addr))).await
     } else {
-        None
+        vec![None; targets.len()]
     };
 
-    Ok(ScanResult {
-        target: config.addr.to_string(),
-        hostname,
-        total_ports,
-        elapsed,
-        ports: results,
-    })
+    targets
+        .iter()
+        .zip(ptrs)
+        .enumerate()
+        .map(|(i, (t, ptr))| {
+            let mut acc = std::mem::take(&mut *accs[i].lock().unwrap_or_else(|p| p.into_inner()));
+            acc.ports
+                .sort_unstable_by_key(|p| (p.port, p.protocol == Transport::Udp));
+            // Anything not accounted for (e.g. a panicked task) is an error too.
+            let seen = acc.ports.len() as u32 + acc.closed + acc.filtered + acc.errors;
+            acc.errors += total.saturating_sub(seen);
+            if acc.errors > 0 {
+                warn!(
+                    target = %t.addr,
+                    errors = acc.errors,
+                    first_error = acc.first_error.as_deref().unwrap_or("task did not complete"),
+                    "{} probes failed, results are incomplete (try a lower --concurrency)",
+                    acc.errors
+                );
+            }
+            debug!(target = %t.addr, open = acc.ports.len(), closed = acc.closed, filtered = acc.filtered, "host done");
+            ScanResult {
+                target: t.addr.to_string(),
+                hostname: ptr.or_else(|| t.name.clone()),
+                total_ports: total,
+                elapsed,
+                ports: acc.ports,
+                closed: acc.closed,
+                filtered: acc.filtered,
+                errors: acc.errors,
+            }
+        })
+        .collect()
+}
+
+// ─── SYN scan ─────────────────────────────────────────────────────────────────
+
+fn open_tcp_result(port: u16) -> PortResult {
+    PortResult {
+        port,
+        protocol: Transport::Tcp,
+        status: PortStatus::Open,
+        service: detect_service(port, Transport::Tcp),
+        banner: None,
+        tls: false,
+        tls_cert: None,
+        legacy_tls: None,
+    }
+}
+
+/// Half-open TCP scan over raw sockets (see `syn.rs`). Banner / TLS probes
+/// then run only against the ports the SYN sweep found open, and UDP (if
+/// requested) goes through the regular engine.
+pub async fn syn_scan_targets(
+    targets: &[Target],
+    config: &ScanConfig,
+) -> Result<Vec<ScanResult>, RustScanError> {
+    use crate::syn::{syn_scan_blocking, SynParams};
+    use futures::StreamExt;
+
+    let start = Instant::now();
+    let v4: Vec<std::net::Ipv4Addr> = targets
+        .iter()
+        .map(|t| match t.addr {
+            IpAddr::V4(a) => Ok(a),
+            IpAddr::V6(a) => Err(RustScanError::InvalidOption(format!(
+                "SYN scan is IPv4-only; {a} needs a connect scan (drop --syn)"
+            ))),
+        })
+        .collect::<Result<_, _>>()?;
+    let params = SynParams {
+        timeout: config.timeout,
+        retries: config.retries,
+        rate: config.rate,
+        randomize: config.randomize,
+        live: config.live,
+    };
+    let ports = config.ports.clone();
+    let hosts = tokio::task::spawn_blocking(move || syn_scan_blocking(&v4, &ports, &params))
+        .await
+        .map_err(|e| RustScanError::Io(io::Error::other(e)))?
+        .map_err(RustScanError::Io)?;
+
+    let mut results = Vec::with_capacity(targets.len());
+    for (t, host) in targets.iter().zip(hosts) {
+        let opts = ProbeOpts {
+            timeout: config.timeout,
+            retries: config.retries,
+            banner: config.banner,
+            tls: config.tls,
+            sni: t.name.as_deref().map(Arc::from),
+        };
+        let ports: Vec<PortResult> = if config.banner || config.tls {
+            futures::stream::iter(host.open.iter().copied())
+                .map(|port| {
+                    let opts = &opts;
+                    async move {
+                        match scan_port(t.addr, port, Transport::Tcp, opts).await {
+                            // The SYN sweep's verdict stands; keep the probe data.
+                            Ok(mut pr) => {
+                                pr.status = PortStatus::Open;
+                                pr
+                            }
+                            Err(_) => open_tcp_result(port),
+                        }
+                    }
+                })
+                .buffered(config.concurrency.min(256))
+                .collect()
+                .await
+        } else {
+            host.open.iter().map(|&p| open_tcp_result(p)).collect()
+        };
+        results.push(ScanResult {
+            target: t.addr.to_string(),
+            hostname: t.name.clone(),
+            total_ports: config.ports.len() as u32,
+            elapsed: Duration::ZERO,
+            ports,
+            closed: host.closed,
+            filtered: host.filtered,
+            errors: 0,
+        });
+    }
+
+    if config.udp {
+        let udp_cfg = ScanConfig {
+            tcp: false,
+            resolve_dns: false,
+            ..config.clone()
+        };
+        for (r, u) in results
+            .iter_mut()
+            .zip(scan_targets(targets, &udp_cfg).await)
+        {
+            r.ports.extend(u.ports);
+            r.ports
+                .sort_unstable_by_key(|p| (p.port, p.protocol == Transport::Udp));
+            r.total_ports += u.total_ports;
+            r.closed += u.closed;
+            r.filtered += u.filtered;
+            r.errors += u.errors;
+        }
+    }
+    if config.resolve_dns {
+        let ptrs =
+            futures::future::join_all(targets.iter().map(|t| crate::dns::reverse_dns(t.addr)))
+                .await;
+        for (r, ptr) in results.iter_mut().zip(ptrs) {
+            r.hostname = ptr.or(r.hostname.take());
+        }
+    }
+    let elapsed = start.elapsed();
+    results.iter_mut().for_each(|r| r.elapsed = elapsed);
+    Ok(results)
+}
+
+// ─── Host discovery ───────────────────────────────────────────────────────────
+
+/// Ports used to decide whether a host is up (any answer, even RST, counts).
+pub const DISCOVERY_PORTS: &[u16] = &[
+    80, 443, 22, 445, 3389, 21, 25, 53, 135, 139, 8080, 8443, 23, 110, 143, 3306, 5900,
+];
+
+/// Keep only hosts that answer on any of `ports` (open *or* closed — an RST
+/// proves the host is alive). Unprivileged equivalent of nmap's ping scan.
+pub async fn discover(targets: Vec<Target>, config: &ScanConfig, ports: &[u16]) -> Vec<Target> {
+    let probe = ScanConfig {
+        ports: ports.to_vec(),
+        retries: 0,
+        banner: false,
+        tls: false,
+        tcp: true,
+        udp: false,
+        resolve_dns: false,
+        live: false,
+        ..config.clone()
+    };
+    let results = scan_targets(&targets, &probe).await;
+    targets
+        .into_iter()
+        .zip(results)
+        .filter(|(_, r)| !r.ports.is_empty() || r.closed > 0)
+        .map(|(t, _)| t)
+        .collect()
+}
+
+fn is_self_connect(local: Option<SocketAddr>, remote: SocketAddr) -> bool {
+    local == Some(remote)
+}
+
+/// In-place Fisher–Yates with a xorshift PRNG seeded from std's random hasher
+/// keys. Not cryptographic — only meant to avoid sequential, IDS-obvious order.
+pub(crate) fn shuffle<T>(v: &mut [T]) {
+    use std::hash::{BuildHasher, Hasher};
+    let mut x = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+        | 1;
+    for i in (1..v.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        v.swap(i, (x % (i as u64 + 1)) as usize);
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -557,71 +708,43 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    // ── scan_port ─────────────────────────────────────────────────────────
+    const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-    /// A closed loopback port returns Closed or Filtered (OS-dependent).
-    #[tokio::test]
-    async fn closed_port_returns_closed_or_filtered() {
-        let result = scan_port(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            1,
-            Transport::Tcp,
-            Duration::from_millis(500),
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.port, 1);
-        assert!(
-            result.status == PortStatus::Closed || result.status == PortStatus::Filtered,
-            "expected Closed or Filtered, got {:?}",
-            result.status
-        );
+    fn opts(ms: u64) -> ProbeOpts {
+        ProbeOpts {
+            timeout: Duration::from_millis(ms),
+            retries: 0,
+            banner: false,
+            tls: false,
+            sni: None,
+        }
     }
 
-    /// TEST-NET-1 (192.0.2.0/24, RFC 5737) is not routable — always Filtered.
-    #[tokio::test]
-    async fn unreachable_address_returns_filtered() {
-        let test_net: IpAddr = "192.0.2.1".parse().unwrap();
-        let result = scan_port(
-            test_net,
-            80,
-            Transport::Tcp,
-            Duration::from_millis(100),
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.port, 80);
-        assert_eq!(result.status, PortStatus::Filtered);
+    fn config(ports: Vec<u16>) -> ScanConfig {
+        ScanConfig {
+            ports,
+            timeout: Duration::from_millis(300),
+            concurrency: 16,
+            retries: 0,
+            rate: None,
+            randomize: true,
+            banner: false,
+            tls: false,
+            tcp: true,
+            udp: false,
+            resolve_dns: false,
+            live: false,
+        }
     }
 
-    /// The returned `PortResult` always carries the probed port number.
-    #[tokio::test]
-    async fn port_result_carries_correct_port() {
-        let result = scan_port(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            9999,
-            Transport::Tcp,
-            Duration::from_millis(300),
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.port, 9999);
+    /// Every probed port must land in exactly one bucket.
+    fn accounted(r: &ScanResult) -> u32 {
+        r.ports.len() as u32 + r.closed + r.filtered + r.errors
     }
-
-    // ── ScanResult helpers ────────────────────────────────────────────────
 
     fn make_result(statuses: &[(u16, PortStatus)]) -> ScanResult {
         ScanResult {
-            target: "127.0.0.1".to_string(),
+            target: "127.0.0.1".into(),
             hostname: None,
             total_ports: statuses.len() as u32,
             elapsed: Duration::from_millis(1),
@@ -635,9 +758,63 @@ mod tests {
                     banner: None,
                     tls: false,
                     tls_cert: None,
+                    legacy_tls: None,
                 })
                 .collect(),
+            closed: 0,
+            filtered: 0,
+            errors: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn closed_port_returns_closed_or_filtered() {
+        let r = scan_port(LOCAL, 1, Transport::Tcp, &opts(500))
+            .await
+            .unwrap();
+        assert_eq!(r.port, 1);
+        assert!(matches!(
+            r.status,
+            PortStatus::Closed | PortStatus::Filtered
+        ));
+    }
+
+    /// TEST-NET-1 (192.0.2.0/24, RFC 5737) is not routable — always Filtered.
+    #[tokio::test]
+    async fn unreachable_address_returns_filtered() {
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let r = scan_port(ip, 80, Transport::Tcp, &opts(100)).await.unwrap();
+        assert_eq!(r.status, PortStatus::Filtered);
+    }
+
+    /// ICMP port-unreachable must map to Closed on every OS.
+    #[tokio::test]
+    async fn closed_udp_port_returns_closed() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port(); // socket dropped: port now closed
+        let r = scan_port(LOCAL, port, Transport::Udp, &opts(500))
+            .await
+            .unwrap();
+        assert_eq!(r.status, PortStatus::Closed);
+    }
+
+    #[tokio::test]
+    async fn answering_udp_service_is_open() {
+        let srv = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = srv.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut b = [0u8; 64];
+            if let Ok((_, from)) = srv.recv_from(&mut b) {
+                let _ = srv.send_to(b"pong", from);
+            }
+        });
+        let r = scan_port(LOCAL, port, Transport::Udp, &opts(1000))
+            .await
+            .unwrap();
+        assert_eq!(r.status, PortStatus::Open);
     }
 
     #[test]
@@ -645,128 +822,134 @@ mod tests {
         let scan = make_result(&[
             (22, PortStatus::Open),
             (80, PortStatus::Open),
-            (443, PortStatus::Closed),
-            (8080, PortStatus::Filtered),
+            (161, PortStatus::OpenFiltered),
         ]);
         assert_eq!(scan.open_count(), 2);
+        assert_eq!(scan.open_ports().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn scan_keeps_only_open_ports_and_accounts_for_all() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap().port();
+        let results = scan_targets(
+            &[Target::ip(LOCAL)],
+            &config(vec![open - 2, open - 1, open]),
+        )
+        .await;
+        let r = &results[0];
+        assert!(r.ports.iter().all(|p| p.status == PortStatus::Open));
+        assert!(r.ports.iter().any(|p| p.port == open));
+        assert_eq!(r.total_ports, 3);
+        assert_eq!(accounted(r), 3);
+    }
+
+    #[tokio::test]
+    async fn multi_host_results_are_per_host_and_complete() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap().port();
+        let targets = [Target::ip(LOCAL), Target::ip("192.0.2.1".parse().unwrap())];
+        let mut cfg = config(vec![open, 9]);
+        cfg.concurrency = 1; // forces queueing through the semaphore
+        cfg.timeout = Duration::from_millis(200);
+        let results = scan_targets(&targets, &cfg).await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].target, "127.0.0.1");
+        assert!(results[0].ports.iter().any(|p| p.port == open));
+        assert_eq!(accounted(&results[0]), 2);
+        assert_eq!(results[1].filtered, 2, "TEST-NET host is silent");
+    }
+
+    #[tokio::test]
+    async fn udp_and_tcp_both_scanned() {
+        let mut cfg = config(vec![9]);
+        cfg.udp = true;
+        let r = &scan_targets(&[Target::ip(LOCAL)], &cfg).await[0];
+        assert_eq!(r.total_ports, 2);
+        assert_eq!(accounted(r), 2);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_spaces_out_probes() {
+        let mut cfg = config((1..=10).collect());
+        cfg.rate = Some(20); // 10 probes at 20/s ≥ 450 ms
+        let t = Instant::now();
+        scan_targets(&[Target::ip(LOCAL)], &cfg).await;
+        assert!(
+            t.elapsed() >= Duration::from_millis(400),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_drops_silent_hosts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let up = Target::ip(LOCAL);
+        let down = Target::ip("192.0.2.1".parse().unwrap());
+        let mut cfg = config(vec![]);
+        cfg.timeout = Duration::from_millis(200);
+        let alive = discover(vec![up.clone(), down], &cfg, &[port]).await;
+        assert_eq!(alive, vec![up]);
     }
 
     #[test]
-    fn open_ports_iter_filters_correctly() {
-        let scan = make_result(&[
-            (22, PortStatus::Open),
-            (80, PortStatus::Closed),
-            (443, PortStatus::Open),
-        ]);
-        let open: Vec<u16> = scan.open_ports().map(|r| r.port).collect();
-        assert_eq!(open, vec![22, 443]);
+    fn resource_errors_are_classified_as_retryable() {
+        let res =
+            |e: io::Error| matches!(os_error("x".into(), e), RustScanError::ResourceExhausted(_));
+        assert!(res(io::Error::from_raw_os_error(if cfg!(windows) {
+            10055
+        } else {
+            24
+        })));
+        assert!(res(io::Error::from(io::ErrorKind::AddrNotAvailable)));
+        assert!(!res(io::Error::from(io::ErrorKind::InvalidInput)));
     }
 
-    // ── scan_host integration ─────────────────────────────────────────────
-
-    /// Full scan on loopback ports 1–10 completes without error.
-    /// Port count and sort order are asserted; open/closed state is not
-    /// (it is environment-dependent).
+    /// A tiny pool still finishes every probe (guards the completion tracker).
     #[tokio::test]
-    async fn scan_host_completes_on_localhost() {
-        let config = Arc::new(ScanConfig {
-            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            start_port: 1,
-            end_port: 10,
-            timeout: Duration::from_millis(200),
-            concurrency: 10,
-            banner: false,
-            tls: false,
-            tcp: true,
-            udp: false,
-            resolve_dns: false,
-        });
-
-        let result = scan_host(config).await.expect("scan should not error");
-
-        assert_eq!(result.total_ports, 10);
-        assert_eq!(result.ports.len(), 10);
-
-        // Results must be sorted by port number.
-        let ports: Vec<u16> = result.ports.iter().map(|r| r.port).collect();
-        assert_eq!(ports, (1u16..=10).collect::<Vec<_>>());
+    async fn completes_with_minimal_concurrency() {
+        let mut cfg = config((1..=8).collect());
+        cfg.concurrency = 1;
+        cfg.timeout = Duration::from_millis(100);
+        let r = &scan_targets(&[Target::ip(LOCAL)], &cfg).await[0];
+        assert_eq!(accounted(r), 8);
     }
 
-    /// Semaphore cap: with concurrency=2 and 8 ports, all 8 are scanned.
-    #[tokio::test]
-    async fn semaphore_cap_does_not_skip_ports() {
-        let config = Arc::new(ScanConfig {
-            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            start_port: 1,
-            end_port: 5,
-            timeout: Duration::from_millis(100),
-            concurrency: 2, // low concurrency to force queueing
-            banner: false,
-            tls: false,
-            tcp: true,
-            udp: false,
-            resolve_dns: false,
-        });
-
-        let result = scan_host(config).await.unwrap();
-        assert_eq!(result.ports.len(), 5, "every port must be scanned");
+    #[test]
+    fn capacity_shrinks_to_floor_only() {
+        let c = AtomicUsize::new(MIN_CONCURRENCY + 1);
+        assert!(try_shrink(&c));
+        assert!(!try_shrink(&c));
+        assert_eq!(c.load(SeqCst), MIN_CONCURRENCY);
     }
 
-    /// Semaphore: live concurrent task count never exceeds `concurrency`.
-    ///
-    /// We cannot directly observe the live count from outside, but we can
-    /// verify that the semaphore has exactly `concurrency` permits after the
-    /// scan (all permits returned).
     #[tokio::test]
-    async fn semaphore_permits_fully_released_after_scan() {
-        const CONCURRENCY: usize = 5;
-        let sem = Arc::new(Semaphore::new(CONCURRENCY));
-
-        let config = Arc::new(ScanConfig {
-            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            start_port: 1,
-            end_port: 20,
-            timeout: Duration::from_millis(300),
-            concurrency: CONCURRENCY,
-            banner: false,
-            tls: false,
-            tcp: true,
-            udp: false,
-            resolve_dns: false,
-        });
-
-        // Manually replicate what scan_host does and then check the semaphore.
-        // (We cannot pass the semaphore into scan_host directly — this test
-        //  validates the permit-release contract at the API level.)
-        let _result = scan_host(config).await.unwrap();
-
-        // After the scan, the original semaphore (not used by scan_host) should
-        // still have all its permits — proving scan_host creates/manages its own
-        // semaphore internally and releases everything on completion.
-        assert_eq!(sem.available_permits(), CONCURRENCY);
+    async fn syn_scan_rejects_ipv6() {
+        let err = syn_scan_targets(&[Target::ip("::1".parse().unwrap())], &config(vec![80]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RustScanError::InvalidOption(_)));
     }
 
-    /// Results are always sorted ascending by port number.
-    #[tokio::test]
-    async fn results_are_sorted_by_port() {
-        let config = Arc::new(ScanConfig {
-            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            start_port: 1,
-            end_port: 50,
-            timeout: Duration::from_millis(300),
-            concurrency: 25,
-            banner: false,
-            tls: false,
-            tcp: true,
-            udp: false,
-            resolve_dns: false,
-        });
+    #[test]
+    fn self_connect_is_detected() {
+        let a: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        assert!(is_self_connect(Some(a), a));
+        assert!(!is_self_connect(
+            Some("127.0.0.1:40001".parse().unwrap()),
+            a
+        ));
+        assert!(!is_self_connect(None, a));
+    }
 
-        let result = scan_host(config).await.unwrap();
-
-        let ports: Vec<u16> = result.ports.iter().map(|r| r.port).collect();
-        let mut sorted = ports.clone();
-        sorted.sort_unstable();
-        assert_eq!(ports, sorted, "results must be sorted by port");
+    #[test]
+    fn shuffle_is_a_permutation() {
+        let mut v: Vec<u32> = (0..1000).collect();
+        shuffle(&mut v);
+        assert_ne!(v, (0..1000).collect::<Vec<_>>(), "should not stay sorted");
+        v.sort_unstable();
+        assert_eq!(v, (0..1000).collect::<Vec<_>>());
     }
 }

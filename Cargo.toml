@@ -1,11 +1,13 @@
 [package]
 name = "rustscan-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+# Highest rust-version among runtime deps (`time`, via x509-parser). CI checks it.
+rust-version = "1.88"
 authors = ["rustscan-rs contributors"]
-description = "A high-performance, async port scanner written in Rust"
+description = "Fast async port scanner with built-in service ID, TLS/legacy-TLS checks and UDP payloads — no root needed"
 license = "MIT"
-repository = "https://github.com/your-org/rustscan-rs"
+repository = "https://github.com/sudu787/portscanner"
 keywords = ["network", "security", "scanner", "port", "async"]
 categories = ["command-line-utilities", "network-programming"]
 readme = "README.md"
@@ -25,9 +27,9 @@ futures = "0.3"
 ipnetwork = "0.20"
 
 # TLS Handshake probing
-tokio-rustls = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pki-types = "1.0"
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive", "color", "suggestions"] }
@@ -46,7 +48,8 @@ serde_json = "1"
 dns-lookup = "3.0.1"
 x509-parser = "0.18.1"
 csv = "1.3"
-askama = "0.12"
+# `config` (askama.toml support) is unused and pulls in unmaintained basic-toml.
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
 
 [profile.release]
 opt-level = 3
@@ -54,7 +57,13 @@ lto = true
 codegen-units = 1
 strip = true
 
+# Raw sockets for the SYN scanner (already in the tree via tokio).
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 tempfile = "3.27.0"

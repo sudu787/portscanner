@@ -1,25 +1,15 @@
-/// cli.rs — Command-line interface definition and validation for rustscan-rs
-///
-/// Built with `clap` (derive API).  After parsing, `CliArgs::validate()`
-/// performs semantic checks that clap's declarative layer cannot express,
-/// returning typed `RustScanError` variants so the caller can handle each
-/// failure precisely.
+//! cli.rs — Command-line interface definition and validation for rustscan-rs
+//!
+//! Built with `clap` (derive API).  After parsing, `CliArgs::validate()`
+//! performs semantic checks that clap's declarative layer cannot express.
 use clap::Parser;
 
 use crate::errors::{Result, RustScanError};
+use crate::ports;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/// Lowest acceptable port number (RFC 793).
-/// Reserved for Phase 4 input validation on banner/TLS flags.
-#[allow(dead_code)]
-pub const PORT_MIN: u16 = 1;
-/// Highest acceptable port number (RFC 793).
-/// Reserved for Phase 4 input validation on banner/TLS flags.
-#[allow(dead_code)]
-pub const PORT_MAX: u16 = 65535;
-
-/// Default starting port for a scan.
+/// Default starting port for a scan (when no `-p` / `--top-ports` is given).
 pub const DEFAULT_START_PORT: u16 = 1;
 /// Default ending port for a scan.
 pub const DEFAULT_END_PORT: u16 = 1024;
@@ -33,231 +23,258 @@ pub const MAX_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_CONCURRENCY: usize = 1_000;
 /// Hard upper limit to prevent accidental resource exhaustion.
 pub const MAX_CONCURRENCY: usize = 65_535;
+/// Upper bound for `--retries`.
+pub const MAX_RETRIES: u8 = 10;
 
 // ─── CLI Definition ───────────────────────────────────────────────────────────
 
-/// rustscan-rs — A high-performance async port scanner written in Rust.
-///
-/// Scans TCP ports on a target host as fast as your network allows.
-/// By default it probes ports 1–1024 with 1 000 concurrent tasks and a
-/// 1 500 ms per-connection timeout.
+/// rustscan-rs — a fast async port scanner with built-in service, TLS and
+/// UDP analysis. No root privileges required.
 #[derive(Parser, Debug, Clone)]
-#[command(
-    name = "rustscan-rs",
-    version,
-    author,
-    about = "A high-performance, async port scanner written in Rust",
-    long_about = None,
-    help_template = "\
-{before-help}{name} {version}
-{author-with-newline}
-{about-with-newline}
-\x1b[1;32mUSAGE:\x1b[0m
-  {usage}
-
-\x1b[1;32mARGUMENTS:\x1b[0m
-{positionals}
-\x1b[1;32mOPTIONS:\x1b[0m
-{options}{after-help}
-"
-)]
+#[command(name = "rustscan-rs", version, author, about, long_about = None)]
 pub struct CliArgs {
-    // ── Positional ─────────────────────────────────────────────────────────
-    /// Target IP address or hostname to scan.
-    ///
-    /// Examples: 192.168.1.1  scanme.nmap.org
+    // ── Targets ────────────────────────────────────────────────────────────
+    /// Targets: IPs, CIDR ranges or hostnames (e.g. 10.0.0.1 10.0.1.0/24 example.com).
     #[arg(value_name = "TARGET")]
-    pub target: String,
+    pub targets: Vec<String>,
 
-    // ── Port range ─────────────────────────────────────────────────────────
-    /// First port of the scan range (1–65535).
-    #[arg(
-        long,
-        value_name = "PORT",
-        default_value_t = DEFAULT_START_PORT,
-        help = "Starting port of the scan range"
-    )]
+    /// Read targets from a file (one per line, `#` comments allowed; `-` = stdin).
+    #[arg(short = 'L', long = "target-file", value_name = "FILE")]
+    pub target_file: Option<String>,
+
+    /// Hosts / CIDR ranges to skip (comma-separated).
+    #[arg(long, value_name = "HOSTS", value_delimiter = ',')]
+    pub exclude: Vec<String>,
+
+    /// Scan every address a hostname resolves to (default: first IPv4, else first).
+    #[arg(long)]
+    pub all_addrs: bool,
+
+    /// Skip host discovery and scan every host (default for single hosts).
+    #[arg(long = "no-discovery", alias = "Pn")]
+    pub no_discovery: bool,
+
+    // ── Ports ──────────────────────────────────────────────────────────────
+    /// Ports to scan: `22,80,443`, `1-1000`, `8000-`, or `-` for all 65535.
+    #[arg(short, long, value_name = "SPEC", conflicts_with_all = ["top_ports", "start_port", "end_port"])]
+    pub ports: Option<String>,
+
+    /// Scan the N most commonly exposed ports.
+    #[arg(long, value_name = "N", conflicts_with_all = ["start_port", "end_port"])]
+    pub top_ports: Option<usize>,
+
+    /// Ports to leave out (same syntax as `-p`).
+    #[arg(long, value_name = "SPEC")]
+    pub exclude_ports: Option<String>,
+
+    /// First port of a contiguous range (legacy; prefer `-p`).
+    #[arg(long, value_name = "PORT", default_value_t = DEFAULT_START_PORT)]
     pub start_port: u16,
 
-    /// Last port of the scan range (1–65535).
-    #[arg(
-        long,
-        value_name = "PORT",
-        default_value_t = DEFAULT_END_PORT,
-        help = "Ending port of the scan range"
-    )]
+    /// Last port of a contiguous range (legacy; prefer `-p`).
+    #[arg(long, value_name = "PORT", default_value_t = DEFAULT_END_PORT)]
     pub end_port: u16,
 
     // ── Timing ─────────────────────────────────────────────────────────────
-    /// Connection timeout in milliseconds (1–300 000).
-    #[arg(
-        long,
-        value_name = "MS",
-        default_value_t = DEFAULT_TIMEOUT_MS,
-        help = "Per-connection timeout in milliseconds"
-    )]
+    /// Per-connection timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_TIMEOUT_MS)]
     pub timeout: u64,
 
-    // ── Concurrency ────────────────────────────────────────────────────────
-    /// Number of concurrent TCP probes in flight at once (1–65535).
-    #[arg(
-        long,
-        value_name = "N",
-        default_value_t = DEFAULT_CONCURRENCY,
-        help = "Maximum number of concurrent probe tasks"
-    )]
+    /// Maximum number of probes in flight at once (across all hosts).
+    #[arg(short, long, value_name = "N", default_value_t = DEFAULT_CONCURRENCY)]
     pub concurrency: usize,
 
-    // ── Output formats ─────────────────────────────────────────────────────
-    /// Emit results as machine-readable JSON.
-    #[arg(long, help = "Output results in JSON format", value_name = "FILE", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["csv", "html"])]
+    /// Re-send a probe that timed out up to N more times (cuts false negatives).
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    pub retries: u8,
+
+    /// Maximum new probes per second (default: unlimited).
+    #[arg(long, value_name = "PPS")]
+    pub rate: Option<u32>,
+
+    /// Probe in ascending order instead of a randomised order.
+    #[arg(long)]
+    pub sequential: bool,
+
+    // ── Output ─────────────────────────────────────────────────────────────
+    /// JSON output. With FILE: write JSON there; without: JSON on stdout.
+    #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "")]
     pub json: Option<String>,
 
-    /// Emit results as CSV (comma-separated values).
-    #[arg(long, help = "Output results in CSV format", value_name = "FILE", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["json", "html"])]
+    /// CSV output. With FILE: write CSV there; without: CSV on stdout.
+    #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "")]
     pub csv: Option<String>,
 
-    /// Emit results as a self-contained HTML report.
-    #[arg(long, help = "Output results as an HTML report", value_name = "FILE", num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["json", "csv"])]
+    /// HTML report. With FILE: write it there; without: HTML on stdout.
+    #[arg(long, value_name = "FILE", num_args = 0..=1, default_missing_value = "")]
     pub html: Option<String>,
 
+    /// Don't stream open ports to stderr while scanning.
+    #[arg(short, long)]
+    pub quiet: bool,
+
     // ── Probing options ────────────────────────────────────────────────────
-    /// Perform a UDP scan.
-    #[arg(long, help = "Perform a UDP scan")]
+    /// Scan UDP ports (uses protocol-specific payloads for DNS, NTP, SNMP, ...).
+    #[arg(long)]
     pub udp: bool,
 
-    /// Perform a TCP scan (default if neither --tcp nor --udp is provided).
-    #[arg(long, help = "Perform a TCP scan")]
+    /// Scan TCP ports (default unless only --udp is given).
+    #[arg(long)]
     pub tcp: bool,
 
-    /// Attempt to grab the service banner on open ports.
-    #[arg(long, help = "Attempt service banner grabbing on open ports")]
+    /// Half-open SYN scan over raw sockets (Linux; root or CAP_NET_RAW).
+    /// Faster, one socket for the whole scan, not logged by services.
+    #[arg(long, visible_alias = "sS")]
+    pub syn: bool,
+
+    /// After the scan, run nmap on just the open ports for deep version
+    /// detection (needs nmap installed; text output only).
+    #[arg(long)]
+    pub nmap: bool,
+
+    /// Arguments for the --nmap hand-off.
+    #[arg(
+        long,
+        value_name = "ARGS",
+        default_value = "-sV",
+        allow_hyphen_values = true
+    )]
+    pub nmap_args: String,
+
+    /// Grab banners on open ports and identify services from them.
+    #[arg(long)]
     pub banner: bool,
 
-    /// Resolve the target hostname to its IP address and display it.
-    #[arg(long, help = "Resolve the target hostname via DNS before scanning")]
+    /// Reverse-resolve each host via DNS (PTR).
+    #[arg(long)]
     pub resolve_dns: bool,
 
-    /// Attempt a TLS handshake on open ports to detect TLS-wrapped services.
-    #[arg(long, help = "Probe open ports for TLS support")]
+    /// Probe open TCP ports for TLS: certificate, expiry, self-signed, legacy TLS 1.0/1.1.
+    #[arg(long)]
     pub tls: bool,
 
-    // ── Verbosity ──────────────────────────────────────────────────────────
-    /// Increase log verbosity.  Repeat for more detail (-v, -vv, -vvv).
-    #[arg(short, long, action = clap::ArgAction::Count, help = "Increase verbosity (use -v, -vv, -vvv)")]
+    /// Increase log verbosity (-v, -vv, -vvv).
+    #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 }
 
 // ─── Output Format Helper ─────────────────────────────────────────────────────
 
-/// The output serialization format chosen by the user.
+/// The format printed on stdout. File exports (`--json FILE` …) are extra.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// Plain human-readable text (default).
     Text,
-    /// JSON (`--json`).
     Json,
-    /// CSV (`--csv`).
     Csv,
-    /// HTML report (`--html`).
     Html,
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 
 impl CliArgs {
-    /// Returns true if a TCP scan should be performed.
     pub fn do_tcp(&self) -> bool {
         self.tcp || !self.udp
     }
 
-    /// Returns true if a UDP scan should be performed.
     pub fn do_udp(&self) -> bool {
         self.udp
     }
-    /// Perform semantic validation that clap's declarative API cannot express.
-    ///
-    /// This is intentionally kept separate from parsing so that unit tests can
-    /// construct `CliArgs` values by hand and test validation independently.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`RustScanError`] variant when:
-    /// - `start_port > end_port`
-    /// - either port is 0 (clap allows 0 as a `u16`)
-    /// - `timeout` is 0 or exceeds [`MAX_TIMEOUT_MS`]
-    /// - `concurrency` is 0 or exceeds [`MAX_CONCURRENCY`]
-    /// - `target` is an empty string
+
+    /// Semantic validation that clap's declarative API cannot express.
     pub fn validate(&self) -> Result<()> {
-        self.validate_target()?;
-        self.validate_ports()?;
-        self.validate_timeout()?;
-        self.validate_concurrency()?;
-        Ok(())
-    }
-
-    /// Derive the output format selected by the user.
-    pub fn output_format(&self) -> OutputFormat {
-        if self.json.is_some() {
-            OutputFormat::Json
-        } else if self.csv.is_some() {
-            OutputFormat::Csv
-        } else if self.html.is_some() {
-            OutputFormat::Html
-        } else {
-            OutputFormat::Text
-        }
-    }
-
-    // ── Private helpers ───────────────────────────────────────────────────
-
-    fn validate_target(&self) -> Result<()> {
-        let t = self.target.trim();
-        if t.is_empty() {
+        if self.targets.iter().all(|t| t.trim().is_empty()) && self.target_file.is_none() {
             return Err(RustScanError::InvalidTarget {
-                target: self.target.clone(),
+                target: self.targets.join(" "),
             });
         }
-        Ok(())
-    }
-
-    fn validate_ports(&self) -> Result<()> {
-        // clap already stores ports as u16, so the 0–65535 type range is
-        // guaranteed.  We only need to reject 0 and inverted ranges.
-        if self.start_port == 0 {
-            return Err(RustScanError::PortOutOfRange {
-                port: self.start_port as u32,
-            });
-        }
-        if self.end_port == 0 {
-            return Err(RustScanError::PortOutOfRange {
-                port: self.end_port as u32,
-            });
-        }
-        if self.start_port > self.end_port {
-            return Err(RustScanError::InvalidPortRange {
-                start: self.start_port,
-                end: self.end_port,
-            });
-        }
-        Ok(())
-    }
-
-    fn validate_timeout(&self) -> Result<()> {
+        self.port_list()?;
         if self.timeout == 0 || self.timeout > MAX_TIMEOUT_MS {
             return Err(RustScanError::InvalidTimeout { ms: self.timeout });
         }
-        Ok(())
-    }
-
-    fn validate_concurrency(&self) -> Result<()> {
         if self.concurrency == 0 || self.concurrency > MAX_CONCURRENCY {
             return Err(RustScanError::InvalidConcurrency {
                 value: self.concurrency,
                 max: MAX_CONCURRENCY,
             });
         }
+        if self.retries > MAX_RETRIES {
+            return Err(RustScanError::InvalidOption(format!(
+                "--retries must be at most {MAX_RETRIES}"
+            )));
+        }
+        if self.rate == Some(0) {
+            return Err(RustScanError::InvalidOption("--rate must be > 0".into()));
+        }
+        let stdout_formats = [&self.json, &self.csv, &self.html]
+            .iter()
+            .filter(|o| o.as_deref() == Some(""))
+            .count();
+        if self.syn && !self.do_tcp() {
+            return Err(RustScanError::InvalidOption(
+                "--syn is a TCP scan; add --tcp or drop --syn".into(),
+            ));
+        }
+        if self.nmap && self.output_format() != OutputFormat::Text {
+            return Err(RustScanError::InvalidOption(
+                "--nmap prints nmap's report, so it needs text output on stdout \
+                 (write JSON/CSV/HTML to files instead)"
+                    .into(),
+            ));
+        }
+        if stdout_formats > 1 {
+            return Err(RustScanError::InvalidOption(
+                "only one of --json/--csv/--html can go to stdout; give the others a FILE".into(),
+            ));
+        }
         Ok(())
+    }
+
+    /// The final, de-duplicated list of ports to probe.
+    pub fn port_list(&self) -> Result<Vec<u16>> {
+        let mut list = if let Some(spec) = &self.ports {
+            ports::parse_ports(spec)?
+        } else if let Some(n) = self.top_ports {
+            if n == 0 {
+                return Err(RustScanError::InvalidOption(
+                    "--top-ports must be > 0".into(),
+                ));
+            }
+            ports::top_ports(n)
+        } else {
+            if self.start_port == 0 || self.end_port == 0 {
+                return Err(RustScanError::PortOutOfRange { port: 0 });
+            }
+            if self.start_port > self.end_port {
+                return Err(RustScanError::InvalidPortRange {
+                    start: self.start_port,
+                    end: self.end_port,
+                });
+            }
+            (self.start_port..=self.end_port).collect()
+        };
+        if let Some(spec) = &self.exclude_ports {
+            let excluded = ports::parse_ports(spec)?;
+            list.retain(|p| excluded.binary_search(p).is_err());
+        }
+        if list.is_empty() {
+            return Err(RustScanError::InvalidOption(
+                "every port was excluded — nothing to scan".into(),
+            ));
+        }
+        Ok(list)
+    }
+
+    /// Which format goes to stdout: the export flag given without a FILE.
+    pub fn output_format(&self) -> OutputFormat {
+        if self.json.as_deref() == Some("") {
+            OutputFormat::Json
+        } else if self.csv.as_deref() == Some("") {
+            OutputFormat::Csv
+        } else if self.html.as_deref() == Some("") {
+            OutputFormat::Html
+        } else {
+            OutputFormat::Text
+        }
     }
 }
 
@@ -267,119 +284,134 @@ impl CliArgs {
 mod tests {
     use super::*;
 
-    /// Build a minimal valid `CliArgs` for use in unit tests.
-    fn valid_args() -> CliArgs {
-        CliArgs {
-            target: "127.0.0.1".to_string(),
-            start_port: 1,
-            end_port: 1024,
-            timeout: DEFAULT_TIMEOUT_MS,
-            concurrency: DEFAULT_CONCURRENCY,
-            json: None,
-            csv: None,
-            html: None,
-            banner: false,
-            resolve_dns: false,
-            tls: false,
-            tcp: true,
-            udp: false,
-            verbose: 0,
-        }
+    fn parse(args: &[&str]) -> CliArgs {
+        CliArgs::try_parse_from(std::iter::once("rustscan-rs").chain(args.iter().copied())).unwrap()
     }
 
     #[test]
     fn valid_configuration_passes() {
-        assert!(valid_args().validate().is_ok());
+        assert!(parse(&["127.0.0.1"]).validate().is_ok());
+    }
+
+    #[test]
+    fn default_ports_are_1_to_1024() {
+        assert_eq!(
+            parse(&["h"]).port_list().unwrap(),
+            (1..=1024).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn port_spec_and_exclusions() {
+        let a = parse(&["h", "-p", "20-25,80", "--exclude-ports", "22,23"]);
+        assert_eq!(a.port_list().unwrap(), vec![20, 21, 24, 25, 80]);
+        let a = parse(&["h", "--top-ports", "2"]);
+        assert_eq!(a.port_list().unwrap(), vec![80, 443]);
+    }
+
+    #[test]
+    fn excluding_everything_fails() {
+        assert!(parse(&["h", "-p", "80", "--exclude-ports", "80"])
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn ports_conflicts_with_range_flags() {
+        let r = CliArgs::try_parse_from(["x", "h", "-p", "80", "--start-port", "1"]);
+        assert!(r.is_err());
     }
 
     #[test]
     fn inverted_port_range_fails() {
-        let mut args = valid_args();
-        args.start_port = 1024;
-        args.end_port = 1;
-        let err = args.validate().unwrap_err();
+        let err = parse(&["h", "--start-port", "1024", "--end-port", "1"])
+            .validate()
+            .unwrap_err();
         assert!(matches!(err, RustScanError::InvalidPortRange { .. }));
     }
 
     #[test]
     fn zero_start_port_fails() {
-        let mut args = valid_args();
-        args.start_port = 0;
-        let err = args.validate().unwrap_err();
+        let err = parse(&["h", "--start-port", "0"]).validate().unwrap_err();
         assert!(matches!(err, RustScanError::PortOutOfRange { .. }));
     }
 
     #[test]
-    fn zero_timeout_fails() {
-        let mut args = valid_args();
-        args.timeout = 0;
-        let err = args.validate().unwrap_err();
-        assert!(matches!(err, RustScanError::InvalidTimeout { .. }));
-    }
-
-    #[test]
-    fn timeout_at_ceiling_passes() {
-        let mut args = valid_args();
-        args.timeout = MAX_TIMEOUT_MS;
-        assert!(args.validate().is_ok());
-    }
-
-    #[test]
-    fn timeout_above_ceiling_fails() {
-        let mut args = valid_args();
-        args.timeout = MAX_TIMEOUT_MS + 1;
+    fn timeout_bounds() {
         assert!(matches!(
-            args.validate().unwrap_err(),
+            parse(&["h", "--timeout", "0"]).validate().unwrap_err(),
             RustScanError::InvalidTimeout { .. }
         ));
+        assert!(parse(&["h", "--timeout", &MAX_TIMEOUT_MS.to_string()])
+            .validate()
+            .is_ok());
+        assert!(
+            parse(&["h", "--timeout", &(MAX_TIMEOUT_MS + 1).to_string()])
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
-    fn zero_concurrency_fails() {
-        let mut args = valid_args();
-        args.concurrency = 0;
+    fn concurrency_bounds() {
         assert!(matches!(
-            args.validate().unwrap_err(),
+            parse(&["h", "-c", "0"]).validate().unwrap_err(),
             RustScanError::InvalidConcurrency { .. }
         ));
+        assert!(parse(&["h", "-c", &MAX_CONCURRENCY.to_string()])
+            .validate()
+            .is_ok());
+        assert!(parse(&["h", "-c", &(MAX_CONCURRENCY + 1).to_string()])
+            .validate()
+            .is_err());
     }
 
     #[test]
-    fn concurrency_at_max_passes() {
-        let mut args = valid_args();
-        args.concurrency = MAX_CONCURRENCY;
-        assert!(args.validate().is_ok());
-    }
-
-    #[test]
-    fn concurrency_above_max_fails() {
-        let mut args = valid_args();
-        args.concurrency = MAX_CONCURRENCY + 1;
-        assert!(matches!(
-            args.validate().unwrap_err(),
-            RustScanError::InvalidConcurrency { .. }
-        ));
+    fn retries_and_rate_bounds() {
+        assert!(parse(&["h", "--retries", "11"]).validate().is_err());
+        assert!(parse(&["h", "--rate", "0"]).validate().is_err());
+        assert!(parse(&["h", "--rate", "500", "--retries", "3"])
+            .validate()
+            .is_ok());
     }
 
     #[test]
     fn empty_target_fails() {
-        let mut args = valid_args();
-        args.target = "   ".to_string();
         assert!(matches!(
-            args.validate().unwrap_err(),
+            parse(&["   "]).validate().unwrap_err(),
             RustScanError::InvalidTarget { .. }
         ));
+        assert!(parse(&[]).validate().is_err());
+        assert!(parse(&["-L", "targets.txt"]).validate().is_ok());
     }
 
     #[test]
-    fn output_format_defaults_to_text() {
-        assert_eq!(valid_args().output_format(), OutputFormat::Text);
+    fn syn_and_nmap_validation() {
+        assert!(parse(&["h", "--syn"]).validate().is_ok());
+        assert!(parse(&["h", "--sS"]).syn);
+        assert!(parse(&["h", "--syn", "--udp"]).validate().is_err());
+        assert!(parse(&["h", "--syn", "--udp", "--tcp"]).validate().is_ok());
+        assert!(parse(&["h", "--nmap"]).validate().is_ok());
+        assert!(parse(&["h", "--nmap", "--json"]).validate().is_err());
+        assert!(parse(&["h", "--nmap", "--json", "f.json"])
+            .validate()
+            .is_ok());
+        assert_eq!(parse(&["h", "--nmap-args", "-sV -sC"]).nmap_args, "-sV -sC");
     }
 
     #[test]
-    fn output_format_json() {
-        let mut args = valid_args();
-        args.json = Some("".to_string());
-        assert_eq!(args.output_format(), OutputFormat::Json);
+    fn output_format_selection() {
+        assert_eq!(parse(&["h"]).output_format(), OutputFormat::Text);
+        assert_eq!(parse(&["h", "--json"]).output_format(), OutputFormat::Json);
+        // A file export keeps text on stdout.
+        assert_eq!(
+            parse(&["h", "--json", "o.json"]).output_format(),
+            OutputFormat::Text
+        );
+        // Several file exports at once are fine; two stdout formats are not.
+        assert!(parse(&["h", "--json", "a", "--csv", "b", "--html", "c"])
+            .validate()
+            .is_ok());
+        assert!(parse(&["h", "--json", "--csv"]).validate().is_err());
     }
 }

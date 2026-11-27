@@ -46,7 +46,6 @@
 /// considered a denial-of-service attack.  We therefore reject prefixes
 /// that would expand to more than MAX_CIDR_HOSTS addresses.
 /// The caller can override this in the future with `--force-large-range`.
-
 use std::net::IpAddr;
 
 use ipnetwork::IpNetwork;
@@ -153,8 +152,8 @@ pub fn parse_target(s: &str) -> Result<ResolvedTarget> {
     // ── 1. Bare IP address ────────────────────────────────────────────────
     if let Ok(ip) = s.parse::<IpAddr>() {
         return Ok(ResolvedTarget {
-            spec:  s.to_string(),
-            kind:  TargetKind::Single(ip),
+            spec: s.to_string(),
+            kind: TargetKind::Single(ip),
             addrs: vec![ip],
         });
     }
@@ -166,8 +165,8 @@ pub fn parse_target(s: &str) -> Result<ResolvedTarget> {
 
     // ── 3. Hostname (DNS resolution deferred to caller) ───────────────────
     Ok(ResolvedTarget {
-        spec:  s.to_string(),
-        kind:  TargetKind::Hostname(s.to_string()),
+        spec: s.to_string(),
+        kind: TargetKind::Hostname(s.to_string()),
         addrs: vec![],
     })
 }
@@ -177,10 +176,12 @@ pub fn parse_target(s: &str) -> Result<ResolvedTarget> {
 /// Parse a string that contains `/` as a CIDR network.
 fn parse_cidr(s: &str) -> Result<ResolvedTarget> {
     // Parse the CIDR notation string.
-    let network: IpNetwork = s.parse().map_err(|e: ipnetwork::IpNetworkError| RustScanError::InvalidCidr {
-        input:  s.to_string(),
-        reason: e.to_string(),
-    })?;
+    let network: IpNetwork =
+        s.parse()
+            .map_err(|e: ipnetwork::IpNetworkError| RustScanError::InvalidCidr {
+                input: s.to_string(),
+                reason: e.to_string(),
+            })?;
 
     // Calculate how many addresses this range contains.
     let count = address_count(network);
@@ -197,9 +198,10 @@ fn parse_cidr(s: &str) -> Result<ResolvedTarget> {
     // Warn on large-but-allowed ranges.
     if count > CIDR_WARN_THRESHOLD {
         warn!(
-            range  = s,
-            hosts  = count,
-            "large CIDR range — this scan will probe {} hosts", count
+            range = s,
+            hosts = count,
+            "large CIDR range — this scan will probe {} hosts",
+            count
         );
     }
 
@@ -207,8 +209,8 @@ fn parse_cidr(s: &str) -> Result<ResolvedTarget> {
     let addrs: Vec<IpAddr> = network.into_iter().collect();
 
     Ok(ResolvedTarget {
-        spec:  s.to_string(),
-        kind:  TargetKind::Network(network),
+        spec: s.to_string(),
+        kind: TargetKind::Network(network),
         addrs,
     })
 }
@@ -342,7 +344,10 @@ mod tests {
     fn hostname_stored_as_is() {
         let t = parse_target("scanme.nmap.org").unwrap();
         assert!(matches!(t.kind, TargetKind::Hostname(_)));
-        assert!(t.addrs.is_empty(), "hostname addrs should be empty until DNS");
+        assert!(
+            t.addrs.is_empty(),
+            "hostname addrs should be empty until DNS"
+        );
     }
 
     #[test]

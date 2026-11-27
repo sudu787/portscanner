@@ -1,0 +1,8 @@
+/target
+# machine-specific cargo settings (e.g. local target-dir)
+/.cargo/config.toml
+# scan outputs
+results.json
+results.csv
+*.html
+!templates/*.html

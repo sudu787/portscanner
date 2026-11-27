@@ -1,190 +1,257 @@
-/// main.rs — Entry point for rustscan-rs
-///
-/// Responsibilities:
-///   1. Parse and validate CLI arguments.
-///   2. Initialise the tracing subscriber.
-///   3. Expand the target spec (IP / CIDR / hostname) via `targets::parse_target`.
-///   4. For each resolved IP, build a `ScanConfig` and drive `scan_host()`.
-///   5. Print results to stdout (text or JSON).
-///
-/// Multi-host workflow (CIDR):
-///   "192.168.1.0/24"
-///     │
-///     └─ targets::parse_target  →  ResolvedTarget { addrs: [.0, .1, ..., .255] }
-///          │
-///          └─ for each addr → scan_host() → ScanResult
-///               │
-///               └─ collect Vec<ScanResult> → print_text_multi / print_json_multi
+//! main.rs — Entry point for rustscan-rs
+//!
+//!   targets (args / -L file) ─► expand CIDRs, resolve hostnames, apply --exclude
+//!     ─► host discovery (multi-host only, unless --no-discovery)
+//!     ─► scanner::scan_targets (one shared concurrency budget)
+//!     ─► stdout format (text/json/csv/html) + any file exports
 
 mod cli;
 pub mod dns;
 pub mod errors;
 pub mod export;
 pub mod output;
+pub mod ports;
 pub mod probes;
 pub mod report;
 pub mod scanner;
 pub mod service;
+pub mod syn;
 pub mod targets;
 pub mod tls;
 
+use std::io::BufRead;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
-use tracing::{debug, info, warn};
+use ipnetwork::IpNetwork;
+use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use cli::{CliArgs, OutputFormat};
-use scanner::{scan_host, ScanConfig, ScanResult};
-use targets::{parse_target, ResolvedTarget, TargetKind};
-
-// ─── Entry point ─────────────────────────────────────────────────────────────
+use scanner::{ScanConfig, Target};
+use targets::{parse_target, TargetKind};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Install default crypto provider for rustls (fixes panic when multiple features are enabled)
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 
-    // ── 1. Parse & validate ───────────────────────────────────────────────
     let args = CliArgs::parse();
     args.validate()
         .context("invalid arguments — run with --help for usage")?;
-
-    // ── 2. Initialise tracing ─────────────────────────────────────────────
     init_tracing(args.verbose);
 
-    debug!(
-        target      = %args.target,
-        start_port  = args.start_port,
-        end_port    = args.end_port,
-        timeout_ms  = args.timeout,
-        concurrency = args.concurrency,
-        "effective configuration"
-    );
-
-    // ── 3. Parse target spec (synchronous: IP / CIDR / hostname) ─────────
-    let mut resolved = parse_target(&args.target)
-        .with_context(|| format!("could not parse target '{}'", args.target))?;
-
-    // ── 4. DNS-resolve hostnames (async) ──────────────────────────────────
-    if let TargetKind::Hostname(_) = &resolved.kind {
-        let addr = resolve_hostname(&args.target)
-            .await
-            .with_context(|| format!("DNS resolution failed for '{}'", args.target))?;
-        info!(hostname = %args.target, resolved = %addr, "hostname resolved");
-        resolved = resolved.with_addr(addr);
+    let ports = args.port_list()?;
+    let specs = collect_specs(&args)?;
+    let label = specs.join(", ");
+    let mut targets = expand_targets(&specs, &args).await?;
+    let multi = targets.len() > 1;
+    if targets.is_empty() {
+        bail!("no targets left to scan (all excluded or unresolvable)");
     }
 
-    // ── 5. Print startup banner ───────────────────────────────────────────
-    print_banner(&args, &resolved);
+    let config = ScanConfig {
+        ports,
+        timeout: Duration::from_millis(args.timeout),
+        concurrency: args.concurrency,
+        retries: args.retries,
+        rate: args.rate,
+        randomize: !args.sequential,
+        banner: args.banner,
+        tls: args.tls,
+        tcp: args.do_tcp(),
+        udp: args.do_udp(),
+        resolve_dns: args.resolve_dns,
+        live: !args.quiet && args.output_format() == OutputFormat::Text,
+    };
 
-    // ── 6. Scan each address in the target list ───────────────────────────
-    let port_count = (args.end_port as u32) - (args.start_port as u32) + 1;
-    let total_start = Instant::now();
-    let mut all_results: Vec<ScanResult> = Vec::with_capacity(resolved.addrs.len());
+    print_banner(&args, &label, &targets, &config);
+    let start = Instant::now();
 
-    for (idx, &addr) in resolved.addrs.iter().enumerate() {
-        if resolved.is_multi_host() {
-            info!(
-                host  = %addr,
-                idx   = idx + 1,
-                total = resolved.addrs.len(),
-                "scanning host"
-            );
+    let discovery = targets.len() > 1 && !args.no_discovery;
+    let before = targets.len();
+    let say_up = |up: usize| {
+        info!(up, total = before, "host discovery done");
+        if args.output_format() == OutputFormat::Text && !args.quiet {
+            eprintln!("Host discovery: {up}/{before} hosts up (use --no-discovery to scan all)");
         }
+    };
 
-        let config = Arc::new(ScanConfig {
-            addr,
-            start_port:  args.start_port,
-            end_port:    args.end_port,
-            timeout:     Duration::from_millis(args.timeout),
-            concurrency: args.concurrency,
-            banner:      args.banner,
-            tls:         args.tls,
-            tcp:         args.do_tcp(),
-            udp:         args.do_udp(),
-            resolve_dns: args.resolve_dns,
-        });
-
-        info!(
-            "scanning {} ports on {} (concurrency={}, timeout={}ms)",
-            port_count, addr, args.concurrency, args.timeout
-        );
-
-        let result = scan_host(config)
-            .await
-            .with_context(|| format!("scan failed for {addr}"))?;
-
-        all_results.push(result);
+    // SYN mode with an enlarged raw send buffer (root) discovers inline:
+    // SYNs are cheap, so scan every host and drop the ones that never
+    // answered. Otherwise SYNs to dead local hosts would pile up in ARP
+    // queues and crowd out live ones, so ping with connects first.
+    let inline = args.syn && discovery && syn::inline_discovery_ok();
+    if discovery && !inline {
+        targets = scanner::discover(targets, &config, scanner::DISCOVERY_PORTS).await;
+        say_up(targets.len());
     }
+    let results = if args.syn {
+        let mut results = scanner::syn_scan_targets(&targets, &config).await?;
+        if inline {
+            results.retain(|r| !r.ports.is_empty() || r.closed > 0);
+            say_up(results.len());
+        }
+        results
+    } else {
+        scanner::scan_targets(&targets, &config).await
+    };
+    let elapsed = start.elapsed();
 
-    let total_elapsed = total_start.elapsed();
-
-    // ── 7. Emit results ───────────────────────────────────────────────────
     match args.output_format() {
-        OutputFormat::Json => output::print_json_multi(&args.target, &all_results, total_elapsed)?,
-        OutputFormat::Csv  => output::print_csv_multi(&all_results),
-        OutputFormat::Html => report::generate_html_report("", &all_results, total_elapsed)?,
-        OutputFormat::Text => output::print_text_multi(&resolved, &all_results, total_elapsed),
+        OutputFormat::Json => output::print_json_multi(&label, &results, elapsed, multi)?,
+        OutputFormat::Csv => output::print_csv_multi(&results)?,
+        OutputFormat::Html => report::generate_html_report("", &results, elapsed)?,
+        OutputFormat::Text => output::print_text_multi(&label, &results, elapsed),
     }
 
-    // ── 5. File Export ───────────────────────────────────────────────────
-    if let Some(path) = &args.json {
-        if !path.is_empty() {
-            export::export_json(path, &all_results)?;
-            info!("Exported JSON to {}", path);
+    for (flag, write) in [
+        (
+            &args.json,
+            export::export_json as fn(&str, &[scanner::ScanResult]) -> _,
+        ),
+        (&args.csv, export::export_csv),
+    ] {
+        if let Some(path) = flag.as_deref().filter(|p| !p.is_empty()) {
+            write(path, &results).with_context(|| format!("writing {path}"))?;
+            info!("exported {path}");
         }
     }
-    
-    if let Some(path) = &args.csv {
-        if !path.is_empty() {
-            export::export_csv(path, &all_results)?;
-            info!("Exported CSV to {}", path);
-        }
+    if let Some(path) = args.html.as_deref().filter(|p| !p.is_empty()) {
+        report::generate_html_report(path, &results, elapsed)
+            .with_context(|| format!("writing {path}"))?;
+        info!("exported {path}");
     }
-
-    if let Some(path) = &args.html {
-        if !path.is_empty() {
-            report::generate_html_report(path, &all_results, total_elapsed)?;
-            info!("Exported HTML report to {}", path);
-        }
+    if args.nmap {
+        run_nmap(&results, &args.nmap_args)?;
     }
-
     Ok(())
 }
 
-// ─── DNS resolution ───────────────────────────────────────────────────────────
-
-/// Resolve a hostname to an `IpAddr` using a blocking DNS lookup on Tokio's
-/// blocking thread-pool, so the async executor is never stalled.
-async fn resolve_hostname(hostname: &str) -> Result<IpAddr> {
-    let lookup = format!("{hostname}:0"); // port 0 = dummy for ToSocketAddrs
-    let lookup_owned = lookup.clone();
-
-    let addrs = tokio::task::spawn_blocking(move || {
-        use std::net::ToSocketAddrs;
-        lookup_owned
-            .to_socket_addrs()
-            .map(|it| it.map(|sa| sa.ip()).collect::<Vec<_>>())
-    })
-    .await
-    .context("DNS resolver panicked")?
-    .with_context(|| format!("DNS lookup failed for '{lookup}'"))?;
-
-    let fallback = addrs.first().copied();
-    addrs
-        .into_iter()
-        .find(|ip| ip.is_ipv4())
-        .or(fallback)
-        .context("DNS returned no addresses")
+/// Hand the open TCP ports to nmap for deep version detection: the fast
+/// sweep finds the ports, nmap only spends time on the few that matter.
+/// `RUSTSCAN_NMAP` overrides the nmap binary (used by tests).
+fn run_nmap(results: &[scanner::ScanResult], nmap_args: &str) -> Result<()> {
+    let bin = std::env::var("RUSTSCAN_NMAP").unwrap_or_else(|_| "nmap".into());
+    for r in results {
+        let ports: Vec<String> = r
+            .ports
+            .iter()
+            .filter(|p| {
+                p.status == scanner::PortStatus::Open && p.protocol == service::Transport::Tcp
+            })
+            .map(|p| p.port.to_string())
+            .collect();
+        if ports.is_empty() {
+            continue;
+        }
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.args(nmap_args.split_whitespace())
+            .arg("-Pn") // we already know the host is up
+            .arg("-p")
+            .arg(ports.join(","))
+            .arg(&r.target);
+        eprintln!(
+            "\n[nmap] {bin} {nmap_args} -Pn -p {} {}",
+            ports.join(","),
+            r.target
+        );
+        let status = cmd
+            .status()
+            .with_context(|| format!("could not run `{bin}` — is nmap installed and on PATH?"))?;
+        if !status.success() {
+            warn!(host = %r.target, %status, "nmap exited with an error");
+        }
+    }
+    Ok(())
 }
 
-// ─── End of output handlers ───────────────────────────────────────────────────
+// ─── Targets ──────────────────────────────────────────────────────────────────
 
-// ─── Tracing initialiser ──────────────────────────────────────────────────────
+/// Positional targets plus lines from `-L FILE` (`-` = stdin).
+fn collect_specs(args: &CliArgs) -> Result<Vec<String>> {
+    let mut specs: Vec<String> = args
+        .targets
+        .iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if let Some(path) = &args.target_file {
+        let reader: Box<dyn BufRead> = if path == "-" {
+            Box::new(std::io::stdin().lock())
+        } else {
+            Box::new(std::io::BufReader::new(
+                std::fs::File::open(path).with_context(|| format!("opening {path}"))?,
+            ))
+        };
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.split('#').next().unwrap_or("").trim();
+            specs.extend(line.split_whitespace().map(String::from));
+        }
+    }
+    if specs.is_empty() {
+        bail!("no targets given");
+    }
+    Ok(specs)
+}
+
+/// Expand CIDRs, resolve hostnames, drop `--exclude`d addresses and duplicates.
+async fn expand_targets(specs: &[String], args: &CliArgs) -> Result<Vec<Target>> {
+    let excluded: Vec<IpNetwork> = args
+        .exclude
+        .iter()
+        .map(|e| e.trim().parse::<IpNetwork>())
+        .collect::<std::result::Result<_, _>>()
+        .context("--exclude takes IPs or CIDR ranges")?;
+
+    let mut out: Vec<Target> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |t: Target| {
+        if !excluded.iter().any(|n| n.contains(t.addr)) && seen.insert(t.addr) {
+            out.push(t);
+        }
+    };
+
+    for spec in specs {
+        let parsed =
+            parse_target(spec).with_context(|| format!("could not parse target '{spec}'"))?;
+        match parsed.kind {
+            TargetKind::Hostname(host) => {
+                let addrs = match dns::resolve_host(&host).await {
+                    Ok(a) if !a.is_empty() => a,
+                    Ok(_) | Err(_) if specs.len() > 1 => {
+                        warn!(host = %host, "DNS resolution failed — skipping");
+                        continue;
+                    }
+                    Ok(_) => bail!("DNS returned no addresses for '{host}'"),
+                    Err(e) => bail!("DNS resolution failed for '{host}': {e}"),
+                };
+                let picked: Vec<IpAddr> = if args.all_addrs {
+                    addrs
+                } else {
+                    if addrs.len() > 1 {
+                        info!(host = %host, using = %addrs[0], others = addrs.len() - 1, "host has several addresses (use --all-addrs to scan all)");
+                    }
+                    vec![addrs[0]]
+                };
+                for addr in picked {
+                    push(Target {
+                        addr,
+                        name: Some(host.clone()),
+                    });
+                }
+            }
+            _ => parsed.addrs.into_iter().for_each(|a| push(Target::ip(a))),
+        }
+    }
+    Ok(out)
+}
+
+// ─── Tracing ──────────────────────────────────────────────────────────────────
 
 fn init_tracing(verbosity: u8) {
     let default_level = match verbosity {
@@ -193,78 +260,92 @@ fn init_tracing(verbosity: u8) {
         2 => "debug",
         _ => "trace",
     };
-
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
-
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .compact()
         .init();
-
-    debug!("tracing initialised at level '{default_level}'");
 }
 
 // ─── Startup banner ───────────────────────────────────────────────────────────
 
-fn print_banner(args: &CliArgs, resolved: &ResolvedTarget) {
-    if args.output_format() == OutputFormat::Json {
+#[allow(non_snake_case)]
+fn print_banner(args: &CliArgs, label: &str, targets: &[Target], config: &ScanConfig) {
+    if args.output_format() != OutputFormat::Text || args.quiet {
         return;
     }
+    use std::io::IsTerminal;
+    let on = output::use_color(std::io::stderr().is_terminal());
+    let (BOLD, CYAN, YELLOW, RESET) = (
+        output::paint(on, "\x1b[1m"),
+        output::paint(on, "\x1b[36m"),
+        output::paint(on, "\x1b[33m"),
+        output::paint(on, "\x1b[0m"),
+    );
 
-    const BOLD:   &str = "\x1b[1m";
-    const CYAN:   &str = "\x1b[36m";
-    const GREEN:  &str = "\x1b[32m";
-    const YELLOW: &str = "\x1b[33m";
-    const RESET:  &str = "\x1b[0m";
+    let ports = &config.ports;
+    let port_desc = if ports.len() == 1 {
+        ports[0].to_string()
+    } else if ports.len() == ports[ports.len() - 1] as usize - ports[0] as usize + 1 {
+        format!(
+            "{}-{} ({} ports)",
+            ports[0],
+            ports[ports.len() - 1],
+            ports.len()
+        )
+    } else {
+        format!("{} ports", ports.len())
+    };
 
     eprintln!();
     eprintln!(
-        "{BOLD}{CYAN}rustscan-rs{RESET} v{} — high-performance async port scanner",
+        "{BOLD}{CYAN}rustscan-rs{RESET} v{} — async port scanner",
         env!("CARGO_PKG_VERSION")
     );
     eprintln!("{CYAN}─────────────────────────────────────────────────{RESET}");
-    eprintln!("  {YELLOW}Target      :{RESET} {}", resolved.display_label());
-    eprintln!("  {YELLOW}Port range  :{RESET} {}–{}", args.start_port, args.end_port);
-    eprintln!("  {YELLOW}Timeout     :{RESET} {} ms", args.timeout);
-    eprintln!("  {YELLOW}Concurrency :{RESET} {} tasks", args.concurrency);
-
-    let mut extras = Vec::new();
-    if args.banner      { extras.push("banner-grab"); }
-    if args.resolve_dns { extras.push("dns-resolve"); }
-    if args.tls         { extras.push("tls-probe"); }
-    if !extras.is_empty() {
-        eprintln!("  {YELLOW}Probes      :{RESET} {}", extras.join(", "));
+    eprintln!(
+        "  {YELLOW}Targets     :{RESET} {label} ({} host{})",
+        targets.len(),
+        if targets.len() == 1 { "" } else { "s" }
+    );
+    eprintln!("  {YELLOW}Ports       :{RESET} {port_desc}");
+    eprintln!(
+        "  {YELLOW}Timing      :{RESET} {} ms timeout, {} retries, {} in flight{}",
+        args.timeout,
+        args.retries,
+        args.concurrency,
+        args.rate
+            .map(|r| format!(", {r} probes/s"))
+            .unwrap_or_default()
+    );
+    let mut extras = vec![if args.do_udp() && args.do_tcp() {
+        "tcp+udp"
+    } else if args.do_udp() {
+        "udp"
+    } else {
+        "tcp"
+    }];
+    if args.banner {
+        extras.push("banner/service-id");
     }
-
-    let fmt_label = match args.output_format() {
-        OutputFormat::Text => "text (default)",
-        OutputFormat::Json => "json",
-        OutputFormat::Csv  => "csv",
-        OutputFormat::Html => "html",
-    };
-    eprintln!("  {YELLOW}Output      :{RESET} {fmt_label}");
-
-    if args.verbose == 0 && args.output_format() == OutputFormat::Text {
-        eprintln!("\n  {GREEN}hint:{RESET} use -v for informational logging, -vv for debug");
+    if args.tls {
+        extras.push("tls+legacy-tls");
     }
-
+    if args.syn {
+        extras.push("syn (half-open)");
+    }
+    if args.nmap {
+        extras.push("nmap hand-off");
+    }
+    if args.resolve_dns {
+        extras.push("rdns");
+    }
+    eprintln!("  {YELLOW}Probes      :{RESET} {}", extras.join(", "));
     eprintln!("{CYAN}─────────────────────────────────────────────────{RESET}");
-    eprintln!();
 
     if args.concurrency > 10_000 {
-        warn!(
-            concurrency = args.concurrency,
-            "concurrency is very high — ensure your OS file-descriptor limits are raised"
-        );
-    }
-
-    if resolved.is_multi_host() {
-        warn!(
-            hosts = resolved.addrs.len(),
-            "multi-host scan — {} sequential host scans will be performed",
-            resolved.addrs.len()
-        );
+        warn!("concurrency is very high — make sure your OS file-descriptor limit allows it");
     }
 }
