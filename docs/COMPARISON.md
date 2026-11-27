@@ -98,19 +98,20 @@ was found and fixed.
 | | rustscan-rs | RustScan | naabu | masscan | nmap |
 |---|---|---|---|---|---|
 | Works without root | **yes** (connect) | yes | connect only | no | connect only |
-| SYN (half-open) scan | ✅ `--syn` (Linux) | ❌ | ✅ | ✅ | ✅ |
+| SYN (half-open) scan | ✅ `--syn` (Linux, macOS, Windows/Npcap) | ❌ | ✅ | ✅ | ✅ |
 | Port lists, ranges, `-` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Top-N common ports | ✅ `--top-ports` | ✅ | ✅ | ✅ | ✅ |
 | Exclude ports / hosts | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Targets from file / stdin | ✅ `-L` | ✅ | ✅ | ✅ | ✅ |
-| CIDR, IPv6, multi-A DNS | ✅ (SYN: IPv4) | ✅ | ✅ | partial | ✅ |
+| CIDR, IPv6, multi-A DNS | ✅ (SYN too) | ✅ | ✅ | partial | ✅ |
 | Host discovery | ✅ TCP ping (RST = up) | ❌ (nmap) | ✅ | ❌ | ✅ |
 | Rate limit / retries | ✅ / ✅ | ❌ / ✅ | ✅ / ✅ | ✅ / ✅ | ✅ / ✅ |
 | Randomised probe order | ✅ default | ✅ | ✅ | ✅ | ✅ |
 | Adapts to OS socket limits | ✅ auto-shrinks | ❌ | — | n/a | ✅ |
 | Live results while scanning | ✅ | ✅ | ✅ | ✅ | partial |
 | Banner grab | ✅ | ❌ (nmap) | ❌ (nmap) | 11 protocols | ✅ |
-| Service ID from banner | ✅ ~15 signatures | ❌ | ❌ | ❌ | ✅ thousands |
+| Service ID from banner | ✅ ~15 signatures |
+| Product version (no nmap) | ✅ ~30 signatures + port probes | ❌ | ❌ | ❌ | ✅ thousands |
 | Hand open ports to nmap | ✅ `--nmap` | ✅ | ✅ | ❌ | n/a |
 | TLS detection + certificate | ✅ SNI-aware | ❌ | ❌ | partial | ✅ (NSE) |
 | Expired / self-signed cert flags | ✅ | ❌ | ❌ | ❌ | ✅ (NSE) |
@@ -129,13 +130,14 @@ own documentation; please open an issue if something is out of date.
 ## Where the others still win
 
 - **nmap**: its own databases (thousands of version probes, OS fingerprints,
-  NSE scripts) are unmatched. rustscan-rs uses them through `--nmap` instead of
-  copying them.
+  NSE scripts) are unmatched. rustscan-rs's built-in version detection covers
+  the common products (OpenSSH, Apache, nginx, IIS, Redis, MySQL/MariaDB,
+  Exim, Postfix, vsftpd, …); for the long tail use `--nmap`.
 - **masscan / ZMap**: at internet scale, with millions of hosts and a custom
   TCP stack at millions of packets per second, they remain the tools to use.
   rustscan-rs `--syn` uses the kernel's raw sockets.
-- **SYN scanning** in rustscan-rs is Linux and IPv4 only. macOS and BSD don't
-  deliver TCP packets to raw sockets, and Windows would need Npcap. Use the
-  connect scan there.
+- **SYN scanning** on Windows needs Npcap installed, and on macOS root. BSDs
+  other than macOS aren't tested. IPv6 SYN skips packets with extension
+  headers.
 - **Scale of these benchmarks.** They used two Docker networks on one machine:
   one host and 16 hosts. They show the trend, not internet-scale numbers.

@@ -245,6 +245,9 @@
                                 </div>
                             {% endif %}
                             
+                            {% if let Some(v) = record.version %}
+                                <div><strong>{{ v }}</strong></div>
+                            {% endif %}
                             {% if let Some(b) = record.banner %}
                                 <div class="banner-text">{{ b }}</div>
                             {% endif %}

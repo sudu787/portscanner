@@ -76,6 +76,11 @@ fn serve_udp() -> u16 {
 
 /// TLS 1.2/1.3 server with a fresh self-signed certificate.
 fn serve_tls() -> u16 {
+    serve_tls_with(None)
+}
+
+/// TLS server that, after the handshake, answers any request with `reply`.
+fn serve_tls_with(reply: Option<&'static [u8]>) -> u16 {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let ck = rcgen::generate_simple_self_signed(vec!["e2e.test".to_string()]).unwrap();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
@@ -97,6 +102,12 @@ fn serve_tls() -> u16 {
                     if conn.complete_io(&mut s).is_err() {
                         return;
                     }
+                }
+                if let Some(reply) = reply {
+                    let mut buf = [0u8; 512];
+                    let _ = conn.complete_io(&mut s); // read the request
+                    let _ = conn.reader().read(&mut buf);
+                    let _ = conn.writer().write_all(reply);
                 }
                 let _ = conn.complete_io(&mut s);
             });
@@ -270,6 +281,70 @@ fn http_banner_includes_server_header() {
     let p = port_entry(&doc, port);
     assert_eq!(p["service"]["name"], "HTTP");
     assert_eq!(p["banner"], "HTTP/1.1 200 OK | Server: e2e-httpd/1.0");
+    assert_eq!(p["version"], "e2e-httpd 1.0");
+}
+
+#[test]
+fn version_from_mysql_handshake() {
+    // Handshake v10: length, seq 0, protocol 10, "8.0.36" NUL, thread id ...
+    let port = serve_tcp(
+        b"J\x00\x00\x00\x0a8.0.36\x00\x08\x00\x00\x00abcdefgh\x00\xff\xf7",
+        false,
+    );
+    let doc = scan_json(&["127.0.0.1", "-p", &port.to_string(), "--banner"]);
+    let p = port_entry(&doc, port);
+    assert_eq!(p["service"]["name"], "MYSQL", "{p:#}");
+    assert_eq!(p["version"], "MySQL 8.0.36");
+}
+
+#[test]
+fn redis_on_odd_port_is_asked_for_its_version() {
+    // Rejects the HTTP probe like Redis does, answers INFO.
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            thread::spawn(move || {
+                s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+                let mut buf = [0u8; 512];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 {
+                        return;
+                    }
+                    let reply: &[u8] = if buf[..n].starts_with(b"INFO") {
+                        b"$40
+# Server
+redis_version:7.2.4
+mode:x
+"
+                    } else {
+                        b"-ERR unknown command 'HEAD'
+"
+                    };
+                    let _ = s.write_all(reply);
+                }
+            });
+        }
+    });
+    let doc = scan_json(&["127.0.0.1", "-p", &port.to_string(), "--banner"]);
+    let p = port_entry(&doc, port);
+    assert_eq!(p["service"]["name"], "REDIS", "{p:#}");
+    assert_eq!(p["version"], "Redis 7.2.4");
+}
+
+#[test]
+fn https_server_header_read_through_tls() {
+    let port = serve_tls_with(Some(
+        b"HTTP/1.1 200 OK
+Server: nginx/1.25.3
+
+",
+    ));
+    let doc = scan_json(&["127.0.0.1", "-p", &port.to_string(), "--banner", "--tls"]);
+    let p = port_entry(&doc, port);
+    assert_eq!(p["tls"], true, "{p:#}");
+    assert_eq!(p["service"]["name"], "HTTPS");
+    assert_eq!(p["version"], "nginx 1.25.3");
 }
 
 #[test]

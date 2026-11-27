@@ -353,7 +353,15 @@ pub fn identify_banner(banner: &str, tls: bool) -> Option<ServiceInfo> {
         ServiceInfo::new("IMAP", Tcp, "IMAP mail server (from banner)")
     } else if b.starts_with("RFB ") {
         ServiceInfo::new("VNC", Tcp, "VNC remote framebuffer (from banner)")
-    } else if b.starts_with("-ERR") || b.starts_with("-NOAUTH") || b.starts_with("-DENIED") {
+    } else if b.starts_with("PostgreSQL") {
+        ServiceInfo::new("POSTGRESQL", Tcp, "PostgreSQL database (from handshake)")
+    } else if b.starts_with("VERSION ") {
+        ServiceInfo::new("MEMCACHED", Tcp, "Memcached (from banner)")
+    } else if b.starts_with("Redis ")
+        || b.starts_with("-ERR")
+        || b.starts_with("-NOAUTH")
+        || b.starts_with("-DENIED")
+    {
         ServiceInfo::new("REDIS", Tcp, "Redis key-value store (from banner)")
     } else if b.starts_with("@RSYNCD") {
         ServiceInfo::new("RSYNC", Tcp, "rsync daemon (from banner)")
@@ -369,11 +377,161 @@ pub fn identify_banner(banner: &str, tls: bool) -> Option<ServiceInfo> {
     Some(info)
 }
 
+// ─── detect_version() ─────────────────────────────────────────────────────────
+
+/// Product signatures: (regex, product). Capture 1 = version, capture 2 =
+/// extra info (distro, build); both optional. Product `*` = take the product
+/// name from capture 1 and the version from capture 2 (generic fallbacks).
+/// First match wins, so specific rules go before generic ones.
+const VERSION_RULES: &[(&str, &str)] = &[
+    // SSH
+    (r"SSH-[\d.]+-OpenSSH_([\w.]+)(?:[ -]+(\S+))?", "OpenSSH"),
+    (r"SSH-[\d.]+-dropbear_([\w.]+)", "Dropbear sshd"),
+    (r"SSH-[\d.]+-libssh[_-]([\w.]+)", "libssh"),
+    // FTP
+    (r"(?i)\(vsFTPd ([\d.]+)\)", "vsftpd"),
+    (r"ProFTPD ([\d.]+\w*)", "ProFTPD"),
+    (
+        r"FileZilla Server(?: version)? ([\d.]+\w*)",
+        "FileZilla ftpd",
+    ),
+    (r"Pure-FTPd", "Pure-FTPd"),
+    (r"Microsoft FTP Service", "Microsoft ftpd"),
+    // Mail
+    (r"ESMTP Exim ([\d.]+)", "Exim smtpd"),
+    (r"ESMTP Postfix()(?: \(([^)]+)\))?", "Postfix smtpd"),
+    (r"Sendmail ([\d.]+/[\d.]+|[\d.]+)", "Sendmail"),
+    (
+        r"Microsoft ESMTP MAIL Service(?:, Version: ([\d.]+))?",
+        "Microsoft ESMTP",
+    ),
+    (r"Dovecot", "Dovecot"),
+    (r"Cyrus (?:IMAP|POP3)\S* v?([\d.]+)", "Cyrus"),
+    // Databases / caches
+    (r"^MySQL ([\w.+~-]+)", "MySQL"),
+    (r"^MariaDB ([\w.+~-]+)", "MariaDB"),
+    (r"^PostgreSQL", "PostgreSQL"),
+    (r"redis_version:([\d.]+)", "Redis"),
+    (r"(?m)^VERSION ([\d.]+)", "memcached"),
+    // Remote desktop
+    (r"^RFB 0*(\d+\.\d+)", "VNC (RFB protocol)"),
+    // HTTP (from the `Server:` header)
+    (r"(?i)Server: nginx/([\d.]+)(?: \(([^)]+)\))?", "nginx"),
+    (
+        r"(?i)Server: Apache/([\d.]+)(?: \(([^)]+)\))?",
+        "Apache httpd",
+    ),
+    (r"(?i)Server: Microsoft-IIS/([\d.]+)", "Microsoft IIS httpd"),
+    (r"(?i)Server: lighttpd/([\d.]+)", "lighttpd"),
+    (r"(?i)Server: openresty/([\d.]+)", "OpenResty"),
+    (r"(?i)Server: Apache-Coyote/([\d.]+)", "Apache Tomcat"),
+    (r"(?i)Server: Jetty\(([\w.-]+)\)", "Jetty"),
+    (r"(?i)Server: Caddy", "Caddy"),
+    (r"(?i)Server: ([A-Za-z][\w.-]*)/(\d[\w.-]*)", "*"),
+    (r"(?i)Server: ([A-Za-z][\w.-]*)", "*"),
+];
+
+static VERSION_RES: std::sync::LazyLock<Vec<(regex::Regex, &'static str)>> =
+    std::sync::LazyLock::new(|| {
+        VERSION_RULES
+            .iter()
+            .map(|(re, p)| (regex::Regex::new(re).expect("valid version rule"), *p))
+            .collect()
+    });
+
+/// Product and version from what a service said, e.g. `"OpenSSH 9.6p1
+/// (Ubuntu-3ubuntu13)"` or `"nginx 1.24.0"`. `None` if no signature matches.
+pub fn detect_version(text: &str) -> Option<String> {
+    VERSION_RES.iter().find_map(|(re, product)| {
+        let c = re.captures(text)?;
+        let cap = |i| {
+            c.get(i)
+                .map(|m: regex::Match| m.as_str())
+                .filter(|s| !s.is_empty())
+        };
+        let (product, version, extra) = if *product == "*" {
+            (cap(1)?, cap(2), None)
+        } else {
+            (*product, cap(1), cap(2))
+        };
+        let mut s = product.to_string();
+        if let Some(v) = version {
+            s += " ";
+            s += v;
+        }
+        if let Some(e) = extra {
+            s += &format!(" ({e})");
+        }
+        Some(crate::probes::sanitize(&s))
+    })
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_product_versions() {
+        let v = |s: &str| detect_version(s);
+        assert_eq!(
+            v("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13").as_deref(),
+            Some("OpenSSH 9.6p1 (Ubuntu-3ubuntu13)")
+        );
+        assert_eq!(v("SSH-2.0-OpenSSH_8.0").as_deref(), Some("OpenSSH 8.0"));
+        assert_eq!(
+            v("SSH-2.0-dropbear_2022.83").as_deref(),
+            Some("Dropbear sshd 2022.83")
+        );
+        assert_eq!(v("220 (vsFTPd 3.0.5)").as_deref(), Some("vsftpd 3.0.5"));
+        assert_eq!(
+            v("220 ProFTPD 1.3.5e Server (Debian)").as_deref(),
+            Some("ProFTPD 1.3.5e")
+        );
+        assert_eq!(
+            v("220 mx.example.com ESMTP Exim 4.96 Mon, 1 Jan").as_deref(),
+            Some("Exim smtpd 4.96")
+        );
+        assert_eq!(
+            v("220 mail ESMTP Postfix (Ubuntu)").as_deref(),
+            Some("Postfix smtpd (Ubuntu)")
+        );
+        assert_eq!(v("+OK Dovecot (Ubuntu) ready.").as_deref(), Some("Dovecot"));
+        assert_eq!(v("MySQL 8.0.36").as_deref(), Some("MySQL 8.0.36"));
+        assert_eq!(
+            v("$3000\r\n# Server\r\nredis_version:7.2.4\r\n").as_deref(),
+            Some("Redis 7.2.4")
+        );
+        assert_eq!(v("VERSION 1.6.21\r\n").as_deref(), Some("memcached 1.6.21"));
+        assert_eq!(
+            v("RFB 003.008").as_deref(),
+            Some("VNC (RFB protocol) 3.008")
+        );
+        assert_eq!(
+            v("HTTP/1.1 200 OK | Server: Apache/2.4.7 (Ubuntu)").as_deref(),
+            Some("Apache httpd 2.4.7 (Ubuntu)")
+        );
+        assert_eq!(
+            v("HTTP/1.1 200 OK | Server: nginx/1.24.0").as_deref(),
+            Some("nginx 1.24.0")
+        );
+        assert_eq!(
+            v("HTTP/1.1 404 | Server: Microsoft-IIS/10.0").as_deref(),
+            Some("Microsoft IIS httpd 10.0")
+        );
+        assert_eq!(
+            v("HTTP/1.0 200 | Server: SimpleHTTP/0.6 Python/3.12").as_deref(),
+            Some("SimpleHTTP 0.6")
+        );
+        assert_eq!(
+            v("HTTP/1.1 200 | Server: cloudflare").as_deref(),
+            Some("cloudflare")
+        );
+        assert_eq!(v("hello world"), None);
+        // Remote text can't smuggle escapes through.
+        assert_eq!(v("Server: evil/1\x1b[31m").as_deref(), Some("evil 1"));
+    }
 
     #[test]
     fn identifies_services_from_banners() {

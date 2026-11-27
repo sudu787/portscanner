@@ -5,9 +5,10 @@
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 
 A fast TCP/UDP port scanner in Rust. It has a no-root async connect scan, a
-raw-socket **SYN scan**, and the first layer of analysis that RustScan and
-naabu leave to nmap: **service ID from banners, TLS certificate checks,
-legacy-TLS detection and protocol-aware UDP probes**. For deeper analysis,
+**SYN scan** on Linux, macOS and Windows (IPv4 and IPv6), and the first layer
+of analysis that RustScan and naabu leave to nmap: **service and version
+detection, TLS certificate checks, legacy-TLS detection and protocol-aware UDP
+probes**. For deeper analysis,
 `--nmap` hands only the open ports to nmap. It ships as one static binary.
 
 Measured over a real network path to a firewalled target, scanning all 65,535
@@ -49,10 +50,18 @@ Scan Results — scanme.example.com (scanme.example.com / 203.0.113.10)
 
 - **Fast**: Tokio async connect scan, one concurrency budget shared across all
   hosts, port × host order randomised, memory O(hosts + open ports).
-- **SYN scan** (`--syn`, Linux, root or `CAP_NET_RAW`): half-open scanning over
-  raw sockets with stateless SYN-cookie reply matching (the masscan approach).
-  It uses one socket for the whole scan and services never log a connection.
-  Banner and TLS probes then run only on the open ports.
+- **SYN scan** (`--syn`, IPv4 and IPv6): half-open scanning with stateless
+  SYN-cookie reply matching (the masscan approach). Linux uses raw sockets
+  (root or `CAP_NET_RAW`); macOS uses libpcap (root) and Windows uses
+  [Npcap](https://npcap.com), both loaded at run time, so the binary still
+  runs without them. Services never log a connection. Banner and TLS probes
+  then run only on the open ports.
+- **Version detection** (`--banner`): port-aware probes (HTTP, Redis `INFO`,
+  memcached, PostgreSQL SSLRequest, MySQL/MariaDB handshake, HTTP inside TLS)
+  and signatures for common products, e.g. `OpenSSH 9.6p1 (Ubuntu-3ubuntu13)`,
+  `Apache httpd 2.4.7 (Ubuntu)`, `nginx 1.25.3`, `Redis 7.2.4`, `MySQL 8.0.36`,
+  `Exim smtpd 4.96`, `vsftpd 3.0.5`. No nmap needed. Its signature set is
+  smaller than nmap's, so use `--nmap` for exhaustive `-sV`.
 - **nmap hand-off** (`--nmap`, `--nmap-args "-sV -sC"`): after the sweep, runs
   nmap on just the open ports, so you get nmap's version and OS detection and
   NSE scripts without nmap scanning every port.
@@ -115,7 +124,7 @@ rustscan-rs example.com --top-ports 100 --banner --tls
 # Every TCP port, fast (no root)
 rustscan-rs 10.0.0.5 -p - -c 5000
 
-# Every TCP port, fastest: SYN scan (Linux; root or CAP_NET_RAW)
+# Every TCP port, fastest: SYN scan (root / CAP_NET_RAW; Npcap on Windows)
 sudo rustscan-rs 10.0.0.5 -p - --syn
 # …or grant the capability once and run it as a normal user:
 sudo setcap cap_net_raw+ep "$(command -v rustscan-rs)"
@@ -158,10 +167,10 @@ taken as a file name.
 | `--rate PPS` | unlimited | max new probes per second |
 | `--sequential` | off | don't randomise probe order |
 | `--tcp` / `--udp` | TCP | protocols to scan (both allowed) |
-| `--syn` (`--sS`) | off | half-open SYN scan (Linux, IPv4, root / `CAP_NET_RAW`) |
+| `--syn` (`--sS`) | off | half-open SYN scan (Linux: root / `CAP_NET_RAW`; macOS: root; Windows: Npcap) |
 | `--nmap` | off | run nmap on the open TCP ports afterwards (text output) |
 | `--nmap-args ARGS` | `-sV` | arguments for the nmap hand-off |
-| `--banner` | off | banner grab + service ID |
+| `--banner` | off | banner grab, service ID and product version |
 | `--tls` | off | TLS / certificate / legacy-TLS audit |
 | `--resolve-dns` | off | reverse DNS (PTR) for each host |
 | `-q, --quiet` | off | no banner / live lines on stderr |
@@ -173,7 +182,7 @@ A single target produces `{"rustscan_rs": {target, resolved_ip, hostname,
 total_ports, open_count, closed_count, filtered_count, error_count, open_ports,
 ports: [...]}}`. Several targets produce `{"rustscan_rs": {target_spec,
 hosts_scanned, total_open_ports, hosts: [...]}}`. Each port entry has `port`,
-`protocol`, `status` (`open` or `open|filtered`), `service`, `banner`, `tls`,
+`protocol`, `status` (`open` or `open|filtered`), `service`, `version`, `banner`, `tls`,
 `tls_cert` (`subject`, `issuer`, `not_after`, `expired`, `self_signed`) and
 `legacy_tls`. Closed and filtered ports are counted, not listed, which keeps
 large scans small.
@@ -182,15 +191,18 @@ large scans small.
 
 - The default is a **connect scan**, which completes the TCP handshake, so
   services may log it. `--syn` never completes a handshake: the kernel resets
-  every SYN-ACK for us. SYN mode is Linux and IPv4 only, because macOS and BSD
-  don't deliver TCP packets to raw sockets.
+  every SYN-ACK for us. macOS and Windows don't let raw sockets do this, so
+  there whole frames are sent and captured through libpcap / Npcap. The
+  link-layer header (gateway or neighbour MAC) is learnt by capturing one UDP
+  datagram the OS sends to each target, so dead LAN hosts are skipped.
 - `filtered` means no answer within `--timeout` after `--retries` re-sends. On
   lossy or rate-limited networks, raise `--retries` or lower `--rate`.
 - UDP `open|filtered` means silence: the port may be open, or a firewall may
   be dropping probes. Services with a built-in payload (DNS, NTP, SNMP, …)
   answer, so they show up as `open`.
-- **Windows** retries a SYN that gets an RST, so closed ports take about a second
-  to report. Linux and macOS report them immediately.
+- **Windows** connect scans: Windows retries a SYN that gets an RST, so closed
+  ports take about a second to report. `--syn` (Npcap) avoids this: a full
+  65,535-port loopback scan takes 4.4 s instead of 200 s.
 - When the OS runs out of sockets, concurrency adapts on its own and the scan
   warns with the value that worked (`pass -c N`). Any probe that still fails
   is counted under `Probe errors` instead of aborting the scan.
@@ -201,9 +213,13 @@ large scans small.
 cargo test                 # unit + end-to-end tests (tests/e2e.rs)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
-# SYN end-to-end tests (Linux; need CAP_NET_RAW on the test binary):
+# SYN end-to-end tests. Linux: CAP_NET_RAW on the binary; macOS: run as
+# root; Windows: Npcap installed.
 cargo test --test syn --no-run && sudo setcap cap_net_raw+ep target/debug/rustscan-rs
 cargo test --test syn -- --ignored
+# Linux, exercising the libpcap (macOS/Windows) code path; loopback needs
+# route_localnet=1 and accept_local=1 on lo (see .github/workflows/ci.yml):
+RUSTSCAN_SYN_BACKEND=pcap cargo test --test syn -- --ignored
 ```
 
 `tests/e2e.rs` runs the real binary against TCP, UDP and TLS servers that it

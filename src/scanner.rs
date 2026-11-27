@@ -71,6 +71,8 @@ pub struct PortResult {
     pub tls_cert: Option<crate::tls::TlsCertInfo>,
     /// `Some("TLSv1.0")` etc. when the server still accepts a deprecated protocol.
     pub legacy_tls: Option<&'static str>,
+    /// Product and version recognised from the service's reply (`--banner`).
+    pub version: Option<String>,
 }
 
 /// Aggregated results for one host.
@@ -177,6 +179,7 @@ pub async fn scan_port(
         tls: false,
         tls_cert: None,
         legacy_tls: None,
+        version: None,
     };
 
     match protocol {
@@ -187,12 +190,24 @@ pub async fn scan_port(
             };
             result.status = PortStatus::Open;
             if opts.banner {
-                result.banner =
-                    grab_banner(&mut stream, opts.timeout.min(Duration::from_secs(2))).await;
+                let g =
+                    grab_banner(&mut stream, port, opts.timeout.min(Duration::from_secs(2))).await;
+                (result.banner, result.version) = (g.banner, g.version);
             }
             drop(stream);
             if opts.tls {
-                result.tls_cert = detect_tls(addr, port, opts.timeout, opts.sni.as_deref()).await;
+                let sni = opts.sni.as_deref();
+                if let Some((cert, raw)) =
+                    detect_tls(addr, port, opts.timeout, sni, opts.banner).await
+                {
+                    result.tls_cert = Some(cert);
+                    // HTTPS: the plaintext probe only got a TLS alert; the
+                    // tunnelled request has the real `Server:` header.
+                    if raw.starts_with(b"HTTP/") {
+                        let g = crate::probes::grab_from(port, &raw);
+                        (result.banner, result.version) = (g.banner, g.version);
+                    }
+                }
                 result.legacy_tls = detect_legacy_tls(addr, port, opts.timeout).await;
                 result.tls = result.tls_cert.is_some() || result.legacy_tls.is_some();
             }
@@ -541,6 +556,7 @@ fn open_tcp_result(port: u16) -> PortResult {
         tls: false,
         tls_cert: None,
         legacy_tls: None,
+        version: None,
     }
 }
 
@@ -555,15 +571,7 @@ pub async fn syn_scan_targets(
     use futures::StreamExt;
 
     let start = Instant::now();
-    let v4: Vec<std::net::Ipv4Addr> = targets
-        .iter()
-        .map(|t| match t.addr {
-            IpAddr::V4(a) => Ok(a),
-            IpAddr::V6(a) => Err(RustScanError::InvalidOption(format!(
-                "SYN scan is IPv4-only; {a} needs a connect scan (drop --syn)"
-            ))),
-        })
-        .collect::<Result<_, _>>()?;
+    let addrs: Vec<IpAddr> = targets.iter().map(|t| t.addr).collect();
     let params = SynParams {
         timeout: config.timeout,
         retries: config.retries,
@@ -572,7 +580,7 @@ pub async fn syn_scan_targets(
         live: config.live,
     };
     let ports = config.ports.clone();
-    let hosts = tokio::task::spawn_blocking(move || syn_scan_blocking(&v4, &ports, &params))
+    let hosts = tokio::task::spawn_blocking(move || syn_scan_blocking(&addrs, &ports, &params))
         .await
         .map_err(|e| RustScanError::Io(io::Error::other(e)))?
         .map_err(RustScanError::Io)?;
@@ -759,6 +767,7 @@ mod tests {
                     tls: false,
                     tls_cert: None,
                     legacy_tls: None,
+                    version: None,
                 })
                 .collect(),
             closed: 0,
@@ -923,14 +932,6 @@ mod tests {
         assert!(try_shrink(&c));
         assert!(!try_shrink(&c));
         assert_eq!(c.load(SeqCst), MIN_CONCURRENCY);
-    }
-
-    #[tokio::test]
-    async fn syn_scan_rejects_ipv6() {
-        let err = syn_scan_targets(&[Target::ip("::1".parse().unwrap())], &config(vec![80]))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RustScanError::InvalidOption(_)));
     }
 
     #[test]

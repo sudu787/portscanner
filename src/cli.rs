@@ -122,7 +122,8 @@ pub struct CliArgs {
     #[arg(long)]
     pub tcp: bool,
 
-    /// Half-open SYN scan over raw sockets (Linux; root or CAP_NET_RAW).
+    /// Half-open SYN scan, IPv4 + IPv6 (Linux: root or CAP_NET_RAW; macOS:
+    /// root; Windows: Npcap).
     /// Faster, one socket for the whole scan, not logged by services.
     #[arg(long, visible_alias = "sS")]
     pub syn: bool,
@@ -141,7 +142,7 @@ pub struct CliArgs {
     )]
     pub nmap_args: String,
 
-    /// Grab banners on open ports and identify services from them.
+    /// Grab banners on open ports; identify the service and product version.
     #[arg(long)]
     pub banner: bool,
 

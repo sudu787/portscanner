@@ -15,6 +15,8 @@ pub struct ExportRecord {
     pub port: u16,
     pub protocol: String,
     pub service: String,
+    /// Product and version recognised from the reply.
+    pub version: Option<String>,
     pub banner: Option<String>,
     pub tls: bool,
     pub tls_subject: Option<String>,
@@ -46,6 +48,7 @@ impl ExportRecord {
             }
             .to_string(),
             service: port_result.service.name.to_string(),
+            version: port_result.version.clone(),
             banner: port_result.banner.clone(),
             tls: port_result.tls,
             tls_subject: cert.map(|c| c.subject.clone()),
@@ -102,6 +105,7 @@ pub fn export_csv(path: &str, results: &[ScanResult]) -> Result<()> {
     for mut record in flat_results {
         for field in [
             &mut record.hostname,
+            &mut record.version,
             &mut record.banner,
             &mut record.tls_subject,
             &mut record.tls_issuer,
@@ -148,6 +152,7 @@ mod tests {
             tls: false,
             tls_cert: None,
             legacy_tls: None,
+            version: None,
         };
 
         let rec = ExportRecord::from_scan_result("127.0.0.1", None, &pr);

@@ -1,11 +1,13 @@
-//! End-to-end SYN-scan tests. They need raw sockets (Linux + root or
-//! CAP_NET_RAW on the binary), so they are `#[ignore]`d by default.
-//! CI runs them with: `sudo setcap cap_net_raw+ep target/debug/rustscan-rs`
-//! then `cargo test --test syn -- --ignored`.
-#![cfg(target_os = "linux")]
+//! End-to-end SYN-scan tests. They need packet access, so they are
+//! `#[ignore]`d by default:
+//! - Linux: raw sockets — `sudo setcap cap_net_raw+ep target/debug/rustscan-rs`,
+//!   or the pcap backend with `RUSTSCAN_SYN_BACKEND=pcap` (root).
+//! - macOS: libpcap (root). Windows: Npcap installed.
+//!
+//! Then: `cargo test --test syn -- --ignored`.
 
 use std::io::Write;
-use std::net::TcpListener;
+use std::net::{TcpListener, ToSocketAddrs};
 use std::thread;
 use std::time::Duration;
 
@@ -24,7 +26,11 @@ fn syn_json(args: &[&str]) -> Value {
 }
 
 fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
+    closed_port_on("127.0.0.1:0")
+}
+
+fn closed_port_on(addr: impl ToSocketAddrs) -> u16 {
+    TcpListener::bind(addr)
         .unwrap()
         .local_addr()
         .unwrap()
@@ -32,7 +38,7 @@ fn closed_port() -> u16 {
 }
 
 #[test]
-#[ignore = "needs CAP_NET_RAW"]
+#[ignore = "needs packet access"]
 fn syn_finds_open_and_closed() {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let open = l.local_addr().unwrap().port();
@@ -47,7 +53,7 @@ fn syn_finds_open_and_closed() {
 }
 
 #[test]
-#[ignore = "needs CAP_NET_RAW"]
+#[ignore = "needs packet access"]
 fn syn_full_range_matches_listeners() {
     let a = TcpListener::bind("127.0.0.1:0").unwrap();
     let b = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -70,7 +76,7 @@ fn syn_full_range_matches_listeners() {
 }
 
 #[test]
-#[ignore = "needs CAP_NET_RAW"]
+#[ignore = "needs packet access"]
 fn syn_then_banner_identifies_service() {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -82,4 +88,18 @@ fn syn_then_banner_identifies_service() {
     });
     let doc = syn_json(&["127.0.0.1", "-p", &port.to_string(), "--banner"]);
     assert_eq!(doc["ports"][0]["service"]["name"], "SSH", "{doc:#}");
+}
+
+#[test]
+#[ignore = "needs packet access"]
+fn syn_ipv6_loopback() {
+    let Ok(l) = TcpListener::bind("[::1]:0") else {
+        eprintln!("no IPv6 loopback here; skipping");
+        return;
+    };
+    let open = l.local_addr().unwrap().port();
+    let closed = closed_port_on("[::1]:0");
+    let doc = syn_json(&["::1", "-p", &format!("{open},{closed}")]);
+    assert_eq!(doc["open_ports"], serde_json::json!([open]), "{doc:#}");
+    assert_eq!(doc["closed_count"], 1, "{doc:#}");
 }

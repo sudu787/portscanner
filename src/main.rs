@@ -10,6 +10,7 @@ pub mod dns;
 pub mod errors;
 pub mod export;
 pub mod output;
+pub mod pcap;
 pub mod ports;
 pub mod probes;
 pub mod report;

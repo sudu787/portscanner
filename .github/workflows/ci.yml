@@ -51,17 +51,41 @@ jobs:
       # (binary-only crate: no library, so no doctests to run)
 
   syn:
-    name: SYN scan (raw sockets, Linux)
+    name: SYN scan (Linux raw sockets + libpcap)
     needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libpcap0.8t64
       - run: cargo test --locked --test syn --no-run
       # Give only the binary under test CAP_NET_RAW; cargo itself stays unprivileged.
       - run: sudo setcap cap_net_raw+ep target/debug/rustscan-rs
-      - run: cargo test --locked --test syn -- --ignored
+      - name: IPv4 + IPv6 over raw sockets
+        run: cargo test --locked --test syn -- --ignored
+      # The macOS / Windows code path (frame injection), exercised on Linux.
+      # Linux drops frames injected on `lo` from 127.0.0.1 as martians unless
+      # these are set (real interfaces don't need them).
+      - name: IPv4 + IPv6 over libpcap
+        run: |
+          sudo sysctl -w net.ipv4.conf.all.route_localnet=1 net.ipv4.conf.lo.route_localnet=1             net.ipv4.conf.all.accept_local=1 net.ipv4.conf.lo.accept_local=1
+          cargo test --locked --test syn -- --ignored
+        env:
+          RUSTSCAN_SYN_BACKEND: pcap
+
+  syn-macos:
+    name: SYN scan (macOS, libpcap)
+    needs: lint
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test syn --no-run
+      # /dev/bpf* needs root. (Windows has no CI job: the free Npcap
+      # installer can't run unattended; that path is tested by hand.)
+      - run: sudo -E "$(command -v cargo)" test --locked --test syn -- --ignored
 
   msrv:
     name: MSRV (1.88)
@@ -112,7 +136,7 @@ jobs:
   ci-ok:
     name: CI passed
     if: always()
-    needs: [lint, test, syn, msrv, audit, docker]
+    needs: [lint, test, syn, syn-macos, msrv, audit, docker]
     runs-on: ubuntu-latest
     steps:
       - run: |

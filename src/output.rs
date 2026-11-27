@@ -141,8 +141,9 @@ pub fn print_text_multi(label: &str, results: &[ScanResult], total_elapsed: Dura
                 } else {
                     ""
                 };
-                let desc = match &pr.banner {
-                    Some(b) => format!("{}{RESET}", b), // Banner overrides description if present
+                let desc = match pr.version.as_ref().or(pr.banner.as_ref()) {
+                    // Recognised version beats the raw banner, which beats the port guess.
+                    Some(b) => format!("{}{RESET}", b),
                     None => format!(
                         "{}{RESET}",
                         if svc.is_known() { svc.description } else { "" }
@@ -213,6 +214,7 @@ pub fn print_json_multi(
                         "tls_cert":    p.tls_cert,
                         "legacy_tls":  p.legacy_tls,
                         "banner":      p.banner,
+                        "version":     p.version,
                         "service": {
                             "name":        p.service.name,
                             "transport":   format!("{:?}", p.service.transport),
@@ -281,7 +283,7 @@ pub fn print_csv_multi(results: &[ScanResult]) -> Result<()> {
 
     let mut wtr = csv::Writer::from_writer(std::io::stdout());
     wtr.write_record([
-        "Host", "Hostname", "Port", "Status", "TLS", "Service", "Banner",
+        "Host", "Hostname", "Port", "Status", "TLS", "Service", "Version", "Banner",
     ])?;
 
     for r in results {
@@ -304,6 +306,7 @@ pub fn print_csv_multi(results: &[ScanResult]) -> Result<()> {
                 status,
                 if p.tls { "true" } else { "false" },
                 p.service.name,
+                &csv_safe(p.version.as_deref().unwrap_or("")),
                 &csv_safe(p.banner.as_deref().unwrap_or("")),
             ])?;
         }

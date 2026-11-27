@@ -38,7 +38,11 @@ const BANNER_MAX: usize = 4096;
 
 /// Read until the peer goes quiet for `first_wait` (then a shorter idle gap)
 /// or `BANNER_MAX` bytes arrive.
-async fn read_some(stream: &mut TcpStream, buf: &mut Vec<u8>, first_wait: Duration) {
+async fn read_some<S: AsyncReadExt + Unpin>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    first_wait: Duration,
+) {
     let mut chunk = [0u8; 2048];
     let mut wait = first_wait;
     while buf.len() < BANNER_MAX {
@@ -50,21 +54,81 @@ async fn read_some(stream: &mut TcpStream, buf: &mut Vec<u8>, first_wait: Durati
     }
 }
 
-/// Try to grab a banner from an open TCP stream.
+const HTTP_PROBE: &[u8] = b"HEAD / HTTP/1.0\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n";
+/// PostgreSQL SSLRequest: the server answers a single `S` or `N`.
+const PG_SSL_REQUEST: &[u8] = &[0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+
+/// What to send to a service that doesn't speak first.
+fn active_probe(port: u16) -> &'static [u8] {
+    match port {
+        6379 => b"INFO server\r\n",
+        11211 => b"version\r\n",
+        5432 => PG_SSL_REQUEST,
+        _ => HTTP_PROBE,
+    }
+}
+
+/// Banner plus the product/version recognised in the service's reply.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Grab {
+    pub banner: Option<String>,
+    pub version: Option<String>,
+}
+
+/// Try to grab a banner from an open TCP stream and identify the product.
 ///
-/// 1. Passive read: many services (SSH, FTP, SMTP, POP3, IMAP, VNC) speak first.
-/// 2. Active probe: otherwise send an HTTP request; also elicits errors from
-///    Redis and similar line protocols.
-pub async fn grab_banner(stream: &mut TcpStream, wait: Duration) -> Option<String> {
+/// 1. Passive read: many services (SSH, FTP, SMTP, POP3, IMAP, VNC, MySQL)
+///    speak first.
+/// 2. Active probe: otherwise a port-specific request (Redis, memcached,
+///    PostgreSQL), or HTTP for everything else.
+/// 3. A line protocol that rejected the HTTP probe with `-ERR` is Redis:
+///    ask it for `INFO server` to get the version.
+pub async fn grab_banner(stream: &mut TcpStream, port: u16, wait: Duration) -> Grab {
     let mut buf = Vec::new();
     read_some(stream, &mut buf, wait).await;
-    if buf.is_empty() {
-        let probe = b"HEAD / HTTP/1.0\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n";
-        if stream.write_all(probe).await.is_ok() {
-            read_some(stream, &mut buf, wait).await;
+    if buf.is_empty() && stream.write_all(active_probe(port)).await.is_ok() {
+        read_some(stream, &mut buf, wait).await;
+    }
+    if buf.starts_with(b"-ERR") && stream.write_all(b"INFO server\r\n").await.is_ok() {
+        read_some(stream, &mut buf, wait).await;
+    }
+    grab_from(port, &buf)
+}
+
+/// Turn a service's raw reply into banner + version.
+pub fn grab_from(port: u16, raw: &[u8]) -> Grab {
+    let banner = binary_banner(port, raw).or_else(|| summarize_banner(raw));
+    let version = banner
+        .as_deref()
+        .and_then(crate::service::detect_version)
+        .or_else(|| crate::service::detect_version(&String::from_utf8_lossy(raw)));
+    Grab { banner, version }
+}
+
+/// Banners of binary protocols, which a "first text line" summary mangles.
+fn binary_banner(port: u16, raw: &[u8]) -> Option<String> {
+    // MySQL / MariaDB handshake v10: 3-byte length, seq, 0x0a, version\0
+    if raw.len() > 6 && raw[4] == 0x0a && raw[3] == 0 {
+        let ver = raw[5..].split(|&b| b == 0).next()?;
+        if !ver.is_empty() && ver.iter().all(|b| b.is_ascii_graphic()) {
+            let ver = sanitize(&String::from_utf8_lossy(ver));
+            return Some(if ver.contains("MariaDB") {
+                // MariaDB prefixes "5.5.5-" for old replication clients.
+                format!("MariaDB {}", ver.trim_start_matches("5.5.5-"))
+            } else {
+                format!("MySQL {ver}")
+            });
         }
     }
-    summarize_banner(&buf)
+    // Redis `INFO` reply: bulk-string length line, then key:value lines.
+    let text = String::from_utf8_lossy(raw);
+    if let Some(line) = text.lines().find(|l| l.starts_with("redis_version:")) {
+        return Some(format!("Redis {}", sanitize(&line[14..])));
+    }
+    if port == 5432 && matches!(raw, b"S" | b"N") {
+        return Some("PostgreSQL (answered SSLRequest)".into());
+    }
+    None
 }
 
 /// First line of the banner; for HTTP also the `Server:` header, which is
@@ -75,6 +139,10 @@ pub fn summarize_banner(data: &[u8]) -> Option<String> {
     let first = sanitize(lines.next().unwrap_or(""));
     if first.is_empty() {
         return None;
+    }
+    // Invalid UTF-8 = a binary protocol; its bytes mean nothing on screen.
+    if first.contains('\u{FFFD}') {
+        return Some(format!("(binary, {} bytes)", data.len()));
     }
     if first.starts_with("HTTP/") {
         if let Some(server) = lines.find_map(|l| {
@@ -95,12 +163,16 @@ pub fn summarize_banner(data: &[u8]) -> Option<String> {
 /// expired / self-signed / wrong-name certs, not reject them. `sni` is the
 /// hostname the user typed (if any) so SNI-routed hosts return the right
 /// certificate; for bare IPs no SNI is sent.
+///
+/// With `http` set, also send an HTTP request through the tunnel and return
+/// the raw reply (for the `Server:` header of HTTPS services).
 pub async fn detect_tls(
     addr: IpAddr,
     port: u16,
     wait: Duration,
     sni: Option<&str>,
-) -> Option<crate::tls::TlsCertInfo> {
+    http: bool,
+) -> Option<(crate::tls::TlsCertInfo, Vec<u8>)> {
     let stream = timeout(wait, TcpStream::connect((addr, port)))
         .await
         .ok()?
@@ -116,7 +188,7 @@ pub async fn detect_tls(
         .unwrap_or(ServerName::IpAddress(addr.into()));
 
     let connector = TlsConnector::from(Arc::new(config));
-    let tls_stream = timeout(wait, connector.connect(server_name, stream))
+    let mut tls_stream = timeout(wait, connector.connect(server_name, stream))
         .await
         .ok()?
         .ok()?;
@@ -127,8 +199,13 @@ pub async fn detect_tls(
         .1
         .peer_certificates()
         .and_then(|certs| certs.first())
-        .and_then(|c| crate::tls::parse_cert(c.as_ref()));
-    Some(info.unwrap_or_else(crate::tls::TlsCertInfo::unknown))
+        .and_then(|c| crate::tls::parse_cert(c.as_ref()))
+        .unwrap_or_else(crate::tls::TlsCertInfo::unknown);
+    let mut raw = Vec::new();
+    if http && tls_stream.write_all(HTTP_PROBE).await.is_ok() {
+        read_some(&mut tls_stream, &mut raw, wait.min(Duration::from_secs(2))).await;
+    }
+    Some((info, raw))
 }
 
 /// Does the server still accept SSLv3 / TLS 1.0 / TLS 1.1? rustls can't speak
@@ -294,6 +371,48 @@ mod tests {
             summarize_banner(raw).unwrap(),
             "HTTP/1.1 200 OK | Server: nginx/1.25.3"
         );
+    }
+
+    #[test]
+    fn binary_banner_is_not_printed_raw() {
+        assert_eq!(
+            summarize_banner(b"\xa3;rk\xf0\x9fX").as_deref(),
+            Some("(binary, 7 bytes)")
+        );
+        assert_eq!(
+            summarize_banner("caf\u{e9}".as_bytes()).as_deref(),
+            Some("caf\u{e9}")
+        );
+    }
+
+    #[test]
+    fn binary_greetings_become_versions() {
+        let g = grab_from(
+            3306,
+            b"J\x00\x00\x00\x0a5.5.5-10.11.6-MariaDB-0+deb12u1\x00\x08",
+        );
+        assert_eq!(
+            g.banner.as_deref(),
+            Some("MariaDB 10.11.6-MariaDB-0+deb12u1")
+        );
+        assert_eq!(
+            g.version.as_deref(),
+            Some("MariaDB 10.11.6-MariaDB-0+deb12u1")
+        );
+        assert_eq!(
+            grab_from(5432, b"N").banner.as_deref(),
+            Some("PostgreSQL (answered SSLRequest)")
+        );
+        assert_eq!(grab_from(9999, b"N").version, None, "only on 5432");
+        let redis = grab_from(
+            6379,
+            b"$9
+# Server
+redis_version:6.2.1
+",
+        );
+        assert_eq!(redis.version.as_deref(), Some("Redis 6.2.1"));
+        assert_eq!(grab_from(80, b""), Grab::default());
     }
 
     #[test]
