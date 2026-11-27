@@ -281,6 +281,12 @@ fn terminal_escapes_in_banners_are_stripped() {
         .success();
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
     assert!(stdout.contains("hello"));
+    // Piped output (not a terminal) carries no colour codes at all.
+    assert!(
+        !stdout.contains('\x1b'),
+        "ANSI codes in piped output: {stdout:?}"
+    );
+    assert!(stdout.contains("Ports scanned : 1"), "plain text greppable");
     assert!(
         !stdout.contains("\x1b]0;pwned"),
         "OSC escape leaked to terminal"

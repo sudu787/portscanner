@@ -15,16 +15,39 @@ use serde_json::{json, to_string_pretty};
 
 use crate::scanner::{PortStatus, ScanResult};
 
+// ─── Colours ──────────────────────────────────────────────────────────────────
+
+/// Colour only when writing to a terminal and `NO_COLOR` is unset
+/// (<https://no-color.org>). Piped or redirected output stays plain, so it
+/// works with grep/awk and in files.
+pub fn use_color(stream_is_terminal: bool) -> bool {
+    stream_is_terminal && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// `code` when colour is on, else "".
+pub fn paint(on: bool, code: &'static str) -> &'static str {
+    if on {
+        code
+    } else {
+        ""
+    }
+}
+
 // ─── Text Output ──────────────────────────────────────────────────────────────
 
+#[allow(non_snake_case)]
 pub fn print_text_multi(label: &str, results: &[ScanResult], total_elapsed: Duration) {
-    const BOLD: &str = "\x1b[1m";
-    const GREEN: &str = "\x1b[32m";
-    const RED: &str = "\x1b[31m";
-    const CYAN: &str = "\x1b[36m";
-    const YELLOW: &str = "\x1b[33m";
-    const DIM: &str = "\x1b[2m";
-    const RESET: &str = "\x1b[0m";
+    use std::io::IsTerminal;
+    let on = use_color(std::io::stdout().is_terminal());
+    let (BOLD, GREEN, RED, CYAN, YELLOW, DIM, RESET) = (
+        paint(on, "\x1b[1m"),
+        paint(on, "\x1b[32m"),
+        paint(on, "\x1b[31m"),
+        paint(on, "\x1b[36m"),
+        paint(on, "\x1b[33m"),
+        paint(on, "\x1b[2m"),
+        paint(on, "\x1b[0m"),
+    );
 
     let multi = results.len() > 1;
 

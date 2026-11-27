@@ -271,14 +271,19 @@ fn init_tracing(verbosity: u8) {
 
 // ─── Startup banner ───────────────────────────────────────────────────────────
 
+#[allow(non_snake_case)]
 fn print_banner(args: &CliArgs, label: &str, targets: &[Target], config: &ScanConfig) {
     if args.output_format() != OutputFormat::Text || args.quiet {
         return;
     }
-    const BOLD: &str = "\x1b[1m";
-    const CYAN: &str = "\x1b[36m";
-    const YELLOW: &str = "\x1b[33m";
-    const RESET: &str = "\x1b[0m";
+    use std::io::IsTerminal;
+    let on = output::use_color(std::io::stderr().is_terminal());
+    let (BOLD, CYAN, YELLOW, RESET) = (
+        output::paint(on, "\x1b[1m"),
+        output::paint(on, "\x1b[36m"),
+        output::paint(on, "\x1b[33m"),
+        output::paint(on, "\x1b[0m"),
+    );
 
     let ports = &config.ports;
     let port_desc = if ports.len() == 1 {
